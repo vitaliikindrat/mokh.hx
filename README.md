@@ -20,10 +20,11 @@ the real CLI; the diff UI is the first, split-based version.
   and `:mokh-send` pushes the current selection as an `@`-mention.
 - `openFile` from Claude opens the file in Helix and jumps to the text it
   names.
-- `openDiff` opens Claude's proposed version of a file in a split next to a
-  unified diff of the change. `:mokh-accept` (or just `:w` in the proposal
-  buffer) sends it back, edits included, and Claude writes the file.
-  `:mokh-reject` refuses it. Closing the buffers also refuses.
+- `openDiff` opens the unified diff of Claude's proposed change in a vertical
+  split. `:mokh-accept` sends it back and Claude writes the file;
+  `:mokh-reject` refuses it, and so does closing the buffer. `:mokh-edit`
+  opens the proposal as an editable buffer when you want to change it first;
+  `:w` there accepts with your edits.
 - Open editors, dirty state, save-on-request and diff-tab cleanup, so the
   CLI's bookkeeping works.
 
@@ -69,6 +70,7 @@ Then in `~/.config/helix/init.scm`:
         (normal (space (m (s ":mokh-send")
                           (a ":mokh-accept")
                           (r ":mokh-reject")
+                          (e ":mokh-edit")
                           (i ":mokh-status")))))
 ```
 
@@ -85,6 +87,7 @@ reports `mokh: Claude Code connected`.
 | `:mokh-send` | Send the primary selection to Claude as an `@`-mention (file and line range) |
 | `:mokh-accept` | Accept the diff under the cursor (or the only pending one) with the proposal buffer's current text |
 | `:mokh-reject` | Reject it |
+| `:mokh-edit` | Open the proposal as an editable buffer below the diff; its text is what accept sends |
 
 `:w` inside a proposal buffer accepts, like the VS Code extension.
 

@@ -29,6 +29,7 @@
          mokh-send
          mokh-accept
          mokh-reject
+         mokh-edit
          mokh-configure!)
 
 ;;;; configuration
@@ -125,11 +126,15 @@
              [range (helix.static.selection->primary-range (helix.static.current-selection-object))]
              [from (helix.static.range->from range)]
              [to (helix.static.range->to range)]
+             ;; Helix's cursor is a one-character selection; Claude should
+             ;; see that as "no selection", like a bare cursor in VS Code.
+             [bare-cursor (<= (- to from) 1)]
+             [to (if bare-cursor from to)]
              [start-line (text.rope-char->line rope from)]
              [end-line (text.rope-char->line rope to)]
              [start-char (- from (text.rope-line->char rope start-line))]
              [end-char (- to (text.rope-line->char rope end-line))]
-             [text (if (equal? from to) "" (helix.static.current-highlighted-text!))])
+             [text (if bare-cursor "" (helix.static.current-highlighted-text!))])
         (selection-json path text start-line start-char end-line end-char))))
 
 (define (remember-selection!)
@@ -224,9 +229,11 @@
   (for-each (lambda (tab) (close-diff! tab)) (hash-keys->list *diffs*))
   (string-append "CLOSED_" (number->string n) "_DIFF_TABS"))
 
-;;;; openDiff: a proposal buffer you can edit next to a unified diff view.
-;;;; Accept answers FILE_SAVED plus the (possibly edited) proposal text, and
-;;;; Claude then writes the file itself. Reject answers DIFF_REJECTED.
+;;;; openDiff: the unified diff in one vertical split, in `diff` highlighting.
+;;;; Accept answers FILE_SAVED plus the proposal text and Claude then writes
+;;;; the file itself; reject answers DIFF_REJECTED. `:mokh-edit` opens the
+;;;; proposal as an editable buffer for the cases where you want to change
+;;;; it before accepting; its text is then what goes back.
 
 (define (tool-open-diff id params)
   (define tab (or (json-string params 'tab_name) "diff"))
@@ -242,13 +249,7 @@
   (define proposal (string-append dir "/" (file-name new-path)))
   (write-file! proposal contents)
   (define origin (editor-focus))
-  ;; Proposal on the right, editable, with the file's own highlighting.
-  (helix.vsplit)
-  (helix.open proposal)
-  (define proposal-view (editor-focus))
-  (define proposal-doc (editor->doc-id proposal-view))
-  ;; Unified diff below it.
-  (helix.hsplit-new)
+  (helix.vsplit-new)
   (set-scratch-buffer-name! (string-append "[mokh] " (file-name new-path)))
   (helix.static.insert_string diff)
   (helix.static.goto_file_start)
@@ -256,32 +257,60 @@
   (helix.set-language "diff")
   (define diff-view (editor-focus))
   (define diff-doc (editor->doc-id diff-view))
-  (editor-set-focus! proposal-view)
   (set! *diffs*
         (hash-insert *diffs* tab
                      (hash 'id id
                            'tab tab
                            'old-path old-path
                            'new-path new-path
+                           'contents contents
                            'proposal proposal
-                           'proposal-doc proposal-doc
+                           'proposal-doc #f
                            'diff-doc diff-doc
                            'origin origin
                            'status "pending")))
   (status (diff-summary (file-name new-path) (exact (round added)) (exact (round removed))))
   #f)
 
+(define (same-doc? a b)
+  (and a b (equal? (doc-id->usize a) (doc-id->usize b))))
+
 (define (diff-for-doc doc)
   (let loop ([tabs (hash-keys->list *diffs*)])
     (cond
       [(null? tabs) #f]
       [else
-       (let* ([d (hash-ref *diffs* (car tabs))]
-              [u (doc-id->usize doc)])
-         (if (or (equal? u (doc-id->usize (hash-ref d 'proposal-doc)))
-                 (equal? u (doc-id->usize (hash-ref d 'diff-doc))))
+       (let ([d (hash-ref *diffs* (car tabs))])
+         (if (or (same-doc? doc (hash-ref d 'proposal-doc))
+                 (same-doc? doc (hash-ref d 'diff-doc)))
              d
              (loop (cdr tabs))))])))
+
+;;@doc
+;; Open Claude's proposed file in an editable buffer below the diff; what
+;; you leave in it is what :mokh-accept (or :w) sends back
+(define (mokh-edit)
+  (let ([d (current-diff)])
+    (cond
+      [(not d) (status "mokh: no pending diff here")]
+      [(hash-ref d 'proposal-doc)
+       (editor-set-focus! (or (editor-doc-in-view? (hash-ref d 'proposal-doc)) (editor-focus)))]
+      [else
+       (let ([diff-view (editor-doc-in-view? (hash-ref d 'diff-doc))])
+         (when diff-view (editor-set-focus! diff-view))
+         (helix.hsplit)
+         (helix.open (hash-ref d 'proposal))
+         (set! *diffs*
+               (hash-insert *diffs* (hash-ref d 'tab)
+                            (hash-insert d 'proposal-doc (editor->doc-id (editor-focus))))))])))
+
+;; What accept sends: the edited buffer when the proposal was opened,
+;; otherwise Claude's text untouched.
+(define (diff-final-text d)
+  (let ([doc (hash-ref d 'proposal-doc)])
+    (if (and doc (editor-doc-exists? doc))
+        (doc-text doc)
+        (hash-ref d 'contents))))
 
 ;; The diff the user means: the one owning the focused buffer, else the only
 ;; pending one.
@@ -295,7 +324,7 @@
     (define tab (hash-ref d 'tab))
     (set! *diffs* (hash-insert *diffs* tab (hash-insert d 'status outcome)))
     (if (equal? outcome "accepted")
-        (let ([content (doc-text (hash-ref d 'proposal-doc))])
+        (let ([content (diff-final-text d)])
           (reply! (hash-ref d 'id) (mcp-content (mcp-text "FILE_SAVED") (mcp-text content)))
           (status (string-append "mokh: accepted " (file-name (hash-ref d 'new-path)))))
         (begin
@@ -315,7 +344,7 @@
       [else (loop (cdr docs))])))
 
 (define (close-view-and-buffer! doc)
-  (when (editor-doc-exists? doc)
+  (when (and doc (editor-doc-exists? doc))
     (let ([view (editor-doc-in-view? doc)])
       (when view
         (editor-set-focus! view)
@@ -357,7 +386,7 @@
 ;; :w in a proposal buffer accepts, like the VS Code extension.
 (define (on-document-saved doc)
   (let ([d (diff-for-doc doc)])
-    (when (and d (equal? (doc-id->usize doc) (doc-id->usize (hash-ref d 'proposal-doc))))
+    (when (and d (same-doc? doc (hash-ref d 'proposal-doc)))
       (resolve-diff! d "accepted"))))
 
 ;;;; dispatch
