@@ -21,11 +21,14 @@ the real CLI; the diff UI is the first, split-based version.
   (`selection_changed`) is available but off by default.
 - `openFile` from Claude opens the file in Helix and jumps to the text it
   names.
-- `openDiff` opens the unified diff of Claude's proposed change in a vertical
-  split. `:mokh-accept` sends it back and Claude writes the file;
-  `:mokh-reject` refuses it, and so does closing the buffer. `:mokh-edit`
-  opens the proposal as an editable buffer when you want to change it first;
-  `:w` there accepts with your edits.
+- `openDiff` shows Claude's proposed change **inline in the real buffer**:
+  lines it deletes get a red background, lines it adds appear as green rows
+  under the line they follow, and the cursor lands on the first hunk.
+  `:mokh-next-hunk` / `:mokh-prev-hunk` move between hunks. `:mokh-accept`
+  sends the proposal back and Claude writes the file; `:mokh-reject` refuses
+  it. `:mokh-edit` opens the proposal as an editable buffer when you want to
+  change it first; `:w` there accepts with your edits. Without the hx patch
+  below, the same flow uses a unified diff in a vertical split instead.
 - Open editors, dirty state, save-on-request and diff-tab cleanup, so the
   CLI's bookkeeping works.
 
@@ -74,6 +77,8 @@ Then in `~/.config/helix/init.scm`:
                           (a ":mokh-accept")
                           (r ":mokh-reject")
                           (e ":mokh-edit")
+                          (n ":mokh-next-hunk")
+                          (p ":mokh-prev-hunk")
                           (i ":mokh-status")))))
 ```
 
@@ -91,7 +96,8 @@ reports `mokh: Claude Code connected`.
 | `:mokh-send-file` | Send the focused file to Claude as an `@`-mention |
 | `:mokh-accept` | Accept the diff under the cursor (or the only pending one) with the proposal buffer's current text |
 | `:mokh-reject` | Reject it |
-| `:mokh-edit` | Open the proposal as an editable buffer below the diff; its text is what accept sends |
+| `:mokh-edit` | Open the proposal as an editable buffer (in the diff window, or a split next to an inline review); its text is what accept sends |
+| `:mokh-next-hunk`, `:mokh-prev-hunk` | Move between hunks of an inline review |
 
 `:w` inside a proposal buffer accepts, like the VS Code extension.
 
@@ -120,6 +126,25 @@ The protocol is the one the VS Code extension speaks, documented by the
 Neovim implementation in
 [coder/claudecode.nvim/PROTOCOL.md](https://github.com/coder/claudecode.nvim/blob/main/PROTOCOL.md).
 It is unofficial; when Anthropic changes it, this follows.
+
+## Inline review and the hx patch
+
+Helix core has no multi-line virtual text, so the inline rendering needs a
+small addition to the Steel fork: a per-document store of virtual rows and
+line highlights, one `LineAnnotation` that reserves the rows (so cursor
+movement and scrolling skip them, like inline diagnostics) and one
+`Decoration` that paints them, exposed to Steel as `add-virtual-lines`,
+`add-line-highlight`, `remove-virtual-text` and `clear-virtual-text` in
+`helix/misc.scm`. It is `patches/helix-virtual-text.patch` (about 350
+lines, additive, against `mattwparas/helix` at `424add1`). Apply it to your
+Steel build; with Nix, add it to the derivation's `patches`. The plugin
+detects the API at load time and falls back to the split view without it;
+`(mokh-configure! #:inline #f)` forces the split view.
+
+The rows use the theme scopes `ui.virtual.diff.minus` and
+`ui.virtual.diff.plus` for the backgrounds (add them to your theme, e.g.
+`bg = "#3b1d22"` and `bg = "#1b3324"`) and `diff.minus` / `diff.plus` for the
+text, which every theme has.
 
 ## Tools
 
@@ -156,10 +181,7 @@ The last call blocks until you `:mokh-accept` or `:mokh-reject` in Helix.
 
 - Hunk-level accept and reject, with a note back to Claude about what was
   reverted (the odiumuniverse/claudecode.nvim idea).
-- Inline rendering: deleted lines as virtual lines inside the real buffer,
-  added lines highlighted. Needs a small addition to the Steel fork (a
-  virtual-lines decoration exposed to plugins); planned as a patch here
-  first, then a PR upstream.
+- Upstream the virtual-text patch to the Steel branch.
 - Review-after-write for auto-accept mode, driven by Claude Code hooks.
 - Real diagnostics once the Steel API exposes them.
 

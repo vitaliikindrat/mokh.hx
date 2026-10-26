@@ -31,6 +31,8 @@
          mokh-accept
          mokh-reject
          mokh-edit
+         mokh-next-hunk
+         mokh-prev-hunk
          mokh-configure!)
 
 ;;;; configuration
@@ -41,6 +43,8 @@
 ;; Off by default: with it on, Claude's prompt always shows "in <file>" for
 ;; whatever buffer is focused. `mokh-send` / `mokh-send-file` are explicit.
 (define *track-selection* #f)
+;; 'auto: inline when hx has the virtual-text API, else the split view.
+(define *inline* 'auto)
 
 ;;@doc
 ;; Configure mokh before `mokh-start`. Keywords: #:bridge (path to
@@ -50,11 +54,13 @@
 (define (mokh-configure! #:bridge (bridge #f)
                          #:ide-name (ide-name #f)
                          #:diff-root (diff-root #f)
-                         #:track-selection (track 'unset))
+                         #:track-selection (track 'unset)
+                         #:inline (inline 'unset))
   (when bridge (set! *bridge-command* bridge))
   (when ide-name (set! *ide-name* ide-name))
   (when diff-root (set! *diff-root* diff-root))
-  (unless (equal? track 'unset) (set! *track-selection* track)))
+  (unless (equal? track 'unset) (set! *track-selection* track))
+  (unless (equal? inline 'unset) (set! *inline* inline)))
 
 ;;;; state
 
@@ -232,11 +238,111 @@
   (for-each (lambda (tab) (close-diff! tab)) (hash-keys->list *diffs*))
   (string-append "CLOSED_" (number->string n) "_DIFF_TABS"))
 
-;;;; openDiff: the unified diff in one vertical split, in `diff` highlighting.
+;;;; openDiff. Two renderings:
+;;;;
+;;;; * inline (default when hx has the virtual-text API, see the patch in
+;;;;   the README): the change is shown in the real buffer -- lines Claude
+;;;;   deletes get a red background, lines it adds appear as green rows
+;;;;   below the line they follow -- and the cursor lands on the first hunk.
+;;;; * split (fallback, or #:inline #f): the unified diff in a vertical
+;;;;   split with `diff` highlighting, cursor on the first hunk.
+;;;;
 ;;;; Accept answers FILE_SAVED plus the proposal text and Claude then writes
 ;;;; the file itself; reject answers DIFF_REJECTED. `:mokh-edit` opens the
-;;;; proposal as an editable buffer for the cases where you want to change
-;;;; it before accepting; its text is then what goes back.
+;;;; proposal as an editable buffer when you want to change it before
+;;;; accepting; its text is then what goes back.
+
+;; The virtual-text functions exist only in a patched hx; look them up at
+;; load time (through the builtin module, which eval-string can reach) so
+;; this file still loads without them.
+(define (lookup-virtual-text name)
+  (with-handler (lambda (_) #f)
+                (eval-string (string-append "(require-builtin helix/core/misc as vt.) vt." name))))
+(define vt-add-lines (lookup-virtual-text "add-virtual-lines"))
+(define vt-add-highlight (lookup-virtual-text "add-line-highlight"))
+(define vt-remove (lookup-virtual-text "remove-virtual-text"))
+
+(define (inline-available?)
+  (and (function? vt-add-lines) (function? vt-add-highlight) (function? vt-remove)))
+
+(define (inline-enabled?)
+  (cond
+    [(equal? *inline* 'auto) (inline-available?)]
+    [else (and *inline* (inline-available?))]))
+
+;; "@@ -12,5 +12,6 @@" -> 11 (0-based old start)
+(define (hunk-old-start line)
+  (let* ([rest (substring line 4 (string-length line))]
+         [range (car (split-many rest " "))]
+         [start (car (split-many range ","))])
+    (- (string->int start) 1)))
+
+;; Unified diff text -> list of (hash 'old-start n 'ops (list (cons tag text) ...))
+;; with tags 'ctx, 'del, 'add. Header lines before the first hunk are skipped.
+(define (parse-unified-diff text)
+  (define (finish hunk) (hash-insert hunk 'ops (reverse (hash-ref hunk 'ops))))
+  (let loop ([lines (split-many text "\n")] [hunks '()] [cur #f])
+    (cond
+      [(null? lines) (reverse (if cur (cons (finish cur) hunks) hunks))]
+      [else
+       (let ([line (car lines)])
+         (cond
+           [(starts-with? line "@@ ")
+            (loop (cdr lines)
+                  (if cur (cons (finish cur) hunks) hunks)
+                  (hash 'old-start (max 0 (hunk-old-start line)) 'ops '()))]
+           [(not cur) (loop (cdr lines) hunks cur)]
+           [(equal? line "") (loop (cdr lines) hunks cur)]
+           [else
+            (let* ([tag (substring line 0 1)]
+                   [body (substring line 1 (string-length line))]
+                   [op (cond
+                         [(equal? tag "-") (cons 'del body)]
+                         [(equal? tag "+") (cons 'add body)]
+                         [(equal? tag " ") (cons 'ctx body)]
+                         [else #f])])
+              (loop (cdr lines)
+                    hunks
+                    (if op (hash-insert cur 'ops (cons op (hash-ref cur 'ops))) cur)))]))])))
+
+(define (virtual-row text)
+  (hash 'style "ui.virtual.diff.plus"
+        'spans (list (hash 'text (string-append "+ " (string-replace text "\t" "    "))
+                           'style "diff.plus"))))
+
+;; Render one hunk into the focused (old) buffer. Returns
+;; (cons first-changed-line item-ids).
+(define (render-hunk! hunk)
+  (define old (hash-ref hunk 'old-start))
+  (define ids '())
+  (define adds '())
+  (define first-change #f)
+  (define (note-change! line) (unless first-change (set! first-change line)))
+  (define (flush-adds!)
+    (unless (null? adds)
+      (let* ([anchor (max 0 (- old 1))]
+             [json (value->jsexpr-string (map virtual-row (reverse adds)))]
+             [id (vt-add-lines anchor json)])
+        (when id (set! ids (cons id ids)))
+        (note-change! anchor))
+      (set! adds '())))
+  (for-each (lambda (op)
+              (cond
+                [(equal? (car op) 'ctx) (flush-adds!) (set! old (+ old 1))]
+                [(equal? (car op) 'del)
+                 (flush-adds!)
+                 (let ([id (vt-add-highlight old "ui.virtual.diff.minus")])
+                   (when id (set! ids (cons id ids))))
+                 (note-change! old)
+                 (set! old (+ old 1))]
+                [else (set! adds (cons (cdr op) adds))]))
+            (hash-ref hunk 'ops))
+  (flush-adds!)
+  (cons (or first-change (hash-ref hunk 'old-start)) ids))
+
+(define (goto-line! line)
+  (helix.goto (number->string (+ 1 line)))
+  (helix.static.align_view_center))
 
 (define (tool-open-diff id params)
   (define tab (or (json-string params 'tab_name) "diff"))
@@ -252,28 +358,81 @@
   (define proposal (string-append dir "/" (file-name new-path)))
   (write-file! proposal contents)
   (define origin (editor-focus))
-  (helix.vsplit-new)
-  (set-scratch-buffer-name! (string-append "[mokh] " (file-name new-path)))
-  (helix.static.insert_string diff)
-  (helix.static.goto_file_start)
-  (helix.static.collapse_selection)
-  (helix.set-language "diff")
-  (define diff-view (editor-focus))
-  (define diff-doc (editor->doc-id diff-view))
-  (set! *diffs*
-        (hash-insert *diffs* tab
-                     (hash 'id id
-                           'tab tab
-                           'old-path old-path
-                           'new-path new-path
-                           'contents contents
-                           'proposal proposal
-                           'proposal-doc #f
-                           'diff-doc diff-doc
-                           'origin origin
-                           'status "pending")))
+  (define base (hash 'id id
+                     'tab tab
+                     'old-path old-path
+                     'new-path new-path
+                     'contents contents
+                     'proposal proposal
+                     'proposal-doc #f
+                     'diff-doc #f
+                     'doc #f
+                     'items '()
+                     'hunk-lines '()
+                     'origin origin
+                     'status "pending"))
+  (define record
+    (if (and (inline-enabled?) (path-exists? old-path))
+        (begin
+          (helix.open old-path)
+          (let* ([doc (editor->doc-id (editor-focus))]
+                 [rendered (map render-hunk! (parse-unified-diff diff))]
+                 [lines (map car rendered)]
+                 [ids (apply append (map cdr rendered))])
+            (unless (null? lines) (goto-line! (car lines)))
+            (hash-insert (hash-insert (hash-insert base 'doc doc) 'items ids) 'hunk-lines lines)))
+        (begin
+          (helix.vsplit-new)
+          (set-scratch-buffer-name! (string-append "[mokh] " (file-name new-path)))
+          (helix.static.insert_string diff)
+          (helix.static.goto_file_start)
+          (helix.static.collapse_selection)
+          (helix.set-language "diff")
+          ;; cursor on the first hunk header
+          (let loop ([lines (split-many diff "\n")] [i 0])
+            (cond
+              [(null? lines) void]
+              [(starts-with? (car lines) "@@ ") (goto-line! i)]
+              [else (loop (cdr lines) (+ i 1))]))
+          (hash-insert base 'diff-doc (editor->doc-id (editor-focus))))))
+  (set! *diffs* (hash-insert *diffs* tab record))
   (status (diff-summary (file-name new-path) (exact (round added)) (exact (round removed))))
   #f)
+
+;; Run thunk with `doc` focused in some window (its own, or the current one).
+(define (with-doc-focused doc thunk)
+  (let ([view (editor-doc-in-view? doc)])
+    (if view
+        (with-focus view thunk)
+        (begin (editor-switch! doc) (thunk)))))
+
+(define (remove-inline-items! d)
+  (let ([doc (hash-ref d 'doc)] [ids (hash-ref d 'items)])
+    (when (and doc (not (null? ids)) (editor-doc-exists? doc))
+      (with-doc-focused doc (lambda () (for-each (lambda (id) (vt-remove id)) ids))))))
+
+;;@doc
+;; Jump to the next hunk of the Claude diff under review
+(define (mokh-next-hunk) (jump-hunk 'next))
+
+;;@doc
+;; Jump to the previous hunk of the Claude diff under review
+(define (mokh-prev-hunk) (jump-hunk 'prev))
+
+(define (jump-hunk direction)
+  (let ([d (current-diff)])
+    (cond
+      [(or (not d) (null? (hash-ref d 'hunk-lines))) (status "mokh: no inline diff here")]
+      [else
+       (let* ([here (helix.static.get-current-line-number)]
+              [lines (hash-ref d 'hunk-lines)]
+              [candidates (filter (lambda (l) (if (equal? direction 'next) (> l here) (< l here))) lines)]
+              [target (cond
+                        [(null? candidates) (if (equal? direction 'next) (car lines) (car (reverse lines)))]
+                        [(equal? direction 'next) (apply min candidates)]
+                        [else (apply max candidates)])])
+         (with-doc-focused (hash-ref d 'doc) (lambda () void))
+         (goto-line! target))])))
 
 (define (same-doc? a b)
   (and a b (equal? (doc-id->usize a) (doc-id->usize b))))
@@ -285,13 +444,15 @@
       [else
        (let ([d (hash-ref *diffs* (car tabs))])
          (if (or (same-doc? doc (hash-ref d 'proposal-doc))
-                 (same-doc? doc (hash-ref d 'diff-doc)))
+                 (same-doc? doc (hash-ref d 'diff-doc))
+                 (same-doc? doc (hash-ref d 'doc)))
              d
              (loop (cdr tabs))))])))
 
 ;;@doc
-;; Open Claude's proposed file in an editable buffer below the diff; what
-;; you leave in it is what :mokh-accept (or :w) sends back
+;; Open Claude's proposed file as an editable buffer (in the diff's window,
+;; or a split next to an inline review); what you leave in it is what
+;; :mokh-accept (or :w) sends back
 (define (mokh-edit)
   (let ([d (current-diff)])
     (cond
@@ -299,9 +460,10 @@
       [(hash-ref d 'proposal-doc)
        (editor-set-focus! (or (editor-doc-in-view? (hash-ref d 'proposal-doc)) (editor-focus)))]
       [else
-       (let ([diff-view (editor-doc-in-view? (hash-ref d 'diff-doc))])
-         (when diff-view (editor-set-focus! diff-view))
-         (helix.hsplit)
+       (let ([diff-view (and (hash-ref d 'diff-doc) (editor-doc-in-view? (hash-ref d 'diff-doc)))])
+         (if diff-view
+             (editor-set-focus! diff-view) ; reuse the diff window
+             (helix.vsplit))
          (helix.open (hash-ref d 'proposal))
          (set! *diffs*
                (hash-insert *diffs* (hash-ref d 'tab)
@@ -363,6 +525,7 @@
       (set! *diffs* (hash-insert *diffs* tab (hash-insert d 'status "rejected")))
       (reply! (hash-ref d 'id) (mcp-content (mcp-text "DIFF_REJECTED"))))
     (define previous (editor-focus))
+    (remove-inline-items! d)
     (close-view-and-buffer! (hash-ref d 'diff-doc))
     (close-view-and-buffer! (hash-ref d 'proposal-doc))
     (set! *diffs* (hash-remove *diffs* tab))

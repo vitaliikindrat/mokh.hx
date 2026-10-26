@@ -1,0 +1,642 @@
+diff --git a/helix-term/src/commands/engine/steel/misc.scm b/helix-term/src/commands/engine/steel/misc.scm
+index 1dca13d..7363624 100644
+--- a/helix-term/src/commands/engine/steel/misc.scm
++++ b/helix-term/src/commands/engine/steel/misc.scm
+@@ -332,3 +332,56 @@ (provide fuzzy-match)
+ ;; pattern : string?
+ ;; input-list : (list? string?)
+ (define fuzzy-match helix.fuzzy-match)
++
++(provide add-virtual-lines)
++;;@doc
++;;Render rows of text below a line of the focused document, for example the
++;;deleted side of a diff hunk. The rows are reserved in the layout, so the
++;;cursor and scrolling skip them, and they follow edits. Returns an id for
++;;`remove-virtual-text`, or #false when the line is out of range.
++;;
++;;```scheme
++;;(add-virtual-lines line lines-json) -> (or int? #false)
++;;```
++;;
++;;line : int? (0-based document line)
++;;lines-json : string? -- a JSON array of
++;;    {"style": "<theme scope for the row>",
++;;     "spans": [{"text": "...", "style": "<theme scope>"}, ...]}
++;;
++;;```scheme
++;;(add-virtual-lines 10 "[{\"style\":\"ui.virtual.diff.minus\",\"spans\":[{\"text\":\"- old line\",\"style\":\"diff.minus\"}]}]")
++;;```
++(define add-virtual-lines helix.add-virtual-lines)
++
++(provide add-line-highlight)
++;;@doc
++;;Paint a theme scope across a whole line of the focused document (the
++;;background shows through the text, like cursorline). Returns an id for
++;;`remove-virtual-text`, or #false when the line is out of range.
++;;
++;;```scheme
++;;(add-line-highlight line scope) -> (or int? #false)
++;;```
++;;
++;;line : int? (0-based document line)
++;;scope : string? e.g. "ui.virtual.diff.plus"
++(define add-line-highlight helix.add-line-highlight)
++
++(provide remove-virtual-text)
++;;@doc
++;;Remove one virtual-text item of the focused document by id.
++;;
++;;```scheme
++;;(remove-virtual-text id) -> bool?
++;;```
++(define remove-virtual-text helix.remove-virtual-text)
++
++(provide clear-virtual-text)
++;;@doc
++;;Remove every virtual-text item of the focused document.
++;;
++;;```scheme
++;;(clear-virtual-text)
++;;```
++(define clear-virtual-text helix.clear-virtual-text)
+diff --git a/helix-term/src/commands/engine/steel/mod.rs b/helix-term/src/commands/engine/steel/mod.rs
+index e017874..e4daa0c 100644
+--- a/helix-term/src/commands/engine/steel/mod.rs
++++ b/helix-term/src/commands/engine/steel/mod.rs
+@@ -4088,6 +4088,10 @@ fn load_misc_api(engine: &mut Engine, generate_sources: bool) {
+         .register_fn_with_ctx(CTX, "add-inlay-hint", add_inlay_hint)
+         .register_fn_with_ctx(CTX, "remove-inlay-hint", remove_inlay_hint)
+         .register_fn_with_ctx(CTX, "remove-inlay-hint-by-id", remove_inlay_hint_by_id)
++        .register_fn_with_ctx(CTX, "add-virtual-lines", add_virtual_lines)
++        .register_fn_with_ctx(CTX, "add-line-highlight", add_line_highlight)
++        .register_fn_with_ctx(CTX, "remove-virtual-text", remove_virtual_text)
++        .register_fn_with_ctx(CTX, "clear-virtual-text", clear_virtual_text)
+         .register_fn("fuzzy-match", fuzzy_match);
+ 
+     if generate_sources {
+@@ -5705,3 +5709,41 @@ pub fn insert_string(cx: &mut Context, string: SteelString) {
+     );
+     doc.apply(&transaction, view.id);
+ }
++
++// "add-virtual-lines": rows of styled text rendered below a document line
++// of the focused document. `lines_json` is a JSON array of
++// {"style": "<theme scope>", "spans": [{"text": "...", "style": "<scope>"}]}.
++pub fn add_virtual_lines(cx: &mut Context, line: usize, lines_json: SteelString) -> Option<usize> {
++    let lines: Vec<helix_view::annotations::virtual_text::VirtualLine> =
++        serde_json::from_str(lines_json.as_str()).ok()?;
++    let (_, doc) = current!(cx.editor);
++    let text = doc.text();
++    if line >= text.len_lines() {
++        return None;
++    }
++    let anchor = text.line_to_char(line);
++    Some(doc.virtual_text.add_lines(anchor, lines))
++}
++
++// "add-line-highlight": paint a theme scope over a whole document line.
++pub fn add_line_highlight(cx: &mut Context, line: usize, style: SteelString) -> Option<usize> {
++    let (_, doc) = current!(cx.editor);
++    let text = doc.text();
++    if line >= text.len_lines() {
++        return None;
++    }
++    let anchor = text.line_to_char(line);
++    Some(doc.virtual_text.add_line_highlight(anchor, style.to_string()))
++}
++
++// "remove-virtual-text": drop one item by the id the add functions returned.
++pub fn remove_virtual_text(cx: &mut Context, id: usize) -> bool {
++    let (_, doc) = current!(cx.editor);
++    doc.virtual_text.remove(id)
++}
++
++// "clear-virtual-text": drop every item in the focused document.
++pub fn clear_virtual_text(cx: &mut Context) {
++    let (_, doc) = current!(cx.editor);
++    doc.virtual_text.clear();
++}
+diff --git a/helix-term/src/ui/editor.rs b/helix-term/src/ui/editor.rs
+index f2f8412..abfcc38 100644
+--- a/helix-term/src/ui/editor.rs
++++ b/helix-term/src/ui/editor.rs
+@@ -8,7 +8,7 @@
+     ui::{
+         document::{render_document, LinePos, TextRenderer},
+         statusline,
+-        text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics},
++        text_decorations::{self, Decoration, DecorationManager, InlineDiagnostics, VirtualTextDecoration},
+         Completion, ProgressSpinners,
+     },
+ };
+@@ -215,6 +215,9 @@ pub fn render_view(
+                 inline_diagnostic_config,
+                 config.end_of_line_diagnostics,
+             ));
++            if !doc.virtual_text.is_empty() {
++                decorations.add_decoration(VirtualTextDecoration::new(doc, theme));
++            }
+             render_document(
+                 surface,
+                 inner,
+diff --git a/helix-term/src/ui/text_decorations.rs b/helix-term/src/ui/text_decorations.rs
+index 7aef472..9a5c2db 100644
+--- a/helix-term/src/ui/text_decorations.rs
++++ b/helix-term/src/ui/text_decorations.rs
+@@ -7,8 +7,10 @@
+ use crate::ui::document::{LinePos, TextRenderer};
+ 
+ pub use diagnostics::InlineDiagnostics;
++pub use virtual_text::VirtualTextDecoration;
+ 
+ mod diagnostics;
++mod virtual_text;
+ 
+ /// Decorations are the primary mechanism for extending the text rendering.
+ ///
+diff --git a/helix-term/src/ui/text_decorations/virtual_text.rs b/helix-term/src/ui/text_decorations/virtual_text.rs
+new file mode 100644
+index 0000000..d47c7e7
+--- /dev/null
++++ b/helix-term/src/ui/text_decorations/virtual_text.rs
+@@ -0,0 +1,106 @@
++//! Paints plugin virtual text: rows reserved by
++//! [`VirtualLinesAnnotation`](helix_view::annotations::virtual_text::VirtualLinesAnnotation)
++//! and whole-line highlights.
++
++use helix_core::doc_formatter::FormattedGrapheme;
++use helix_core::unicode::width::UnicodeWidthStr;
++use helix_core::Position;
++use helix_view::annotations::virtual_text::VirtualLinesWalker;
++use helix_view::graphics::Rect;
++use helix_view::theme::Style;
++use helix_view::{Document, Theme};
++
++use crate::ui::document::{LinePos, TextRenderer};
++use crate::ui::text_decorations::Decoration;
++
++pub struct VirtualTextDecoration<'a> {
++    walker: VirtualLinesWalker<'a>,
++    highlights: Vec<(usize, Style)>,
++    theme: &'a Theme,
++}
++
++impl<'a> VirtualTextDecoration<'a> {
++    pub fn new(doc: &'a Document, theme: &'a Theme) -> Self {
++        let text = doc.text().slice(..);
++        VirtualTextDecoration {
++            walker: VirtualLinesWalker::new(doc.virtual_text.blocks_by_line_end(text)),
++            highlights: doc
++                .virtual_text
++                .line_highlights(text)
++                .into_iter()
++                .map(|(line, scope)| (line, theme.get(scope)))
++                .collect(),
++            theme,
++        }
++    }
++}
++
++impl Decoration for VirtualTextDecoration<'_> {
++    fn reset_pos(&mut self, pos: usize) -> usize {
++        self.walker.reset(pos)
++    }
++
++    fn decorate_grapheme(
++        &mut self,
++        _renderer: &mut TextRenderer,
++        grapheme: &FormattedGrapheme,
++    ) -> usize {
++        self.walker.anchor_reached(grapheme.char_idx)
++    }
++
++    fn decorate_line(&mut self, renderer: &mut TextRenderer, pos: LinePos) {
++        if let Ok(i) = self
++            .highlights
++            .binary_search_by_key(&pos.doc_line, |(line, _)| *line)
++        {
++            let style = self.highlights[i].1;
++            let viewport = renderer.viewport;
++            renderer.set_style(
++                Rect::new(viewport.x, pos.visual_line, viewport.width, 1),
++                style,
++            );
++        }
++    }
++
++    fn render_virt_lines(
++        &mut self,
++        renderer: &mut TextRenderer,
++        pos: LinePos,
++        virt_off: Position,
++    ) -> Position {
++        let lines = self.walker.take_pending();
++        if lines.is_empty() {
++            return Position::new(0, 0);
++        }
++        let viewport = renderer.viewport;
++        let last_row = (renderer.offset.row + viewport.height as usize) as u16;
++        let mut row = pos.visual_line + virt_off.row as u16;
++        for line in &lines {
++            if row >= last_row {
++                break;
++            }
++            let row_style = if line.style.is_empty() {
++                Style::default()
++            } else {
++                self.theme.get(&line.style)
++            };
++            renderer.set_style(Rect::new(viewport.x, row, viewport.width, 1), row_style);
++            let mut col = 0usize;
++            for span in &line.spans {
++                if col >= viewport.width as usize {
++                    break;
++                }
++                let style = if span.style.is_empty() {
++                    row_style
++                } else {
++                    row_style.patch(self.theme.get(&span.style))
++                };
++                let remaining = viewport.width as usize - col;
++                renderer.set_stringn(viewport.x + col as u16, row, &span.text, remaining, style);
++                col += span.text.width();
++            }
++            row += 1;
++        }
++        Position::new(lines.len(), 0)
++    }
++}
+diff --git a/helix-view/src/annotations.rs b/helix-view/src/annotations.rs
+index 4c63048..6e6274d 100644
+--- a/helix-view/src/annotations.rs
++++ b/helix-view/src/annotations.rs
+@@ -1 +1,2 @@
+ pub mod diagnostics;
++pub mod virtual_text;
+diff --git a/helix-view/src/annotations/virtual_text.rs b/helix-view/src/annotations/virtual_text.rs
+new file mode 100644
+index 0000000..070bb1f
+--- /dev/null
++++ b/helix-view/src/annotations/virtual_text.rs
+@@ -0,0 +1,302 @@
++//! Plugin-provided virtual text: blocks of styled rows rendered below a
++//! document line, and whole-line highlights. Items are anchored by char
++//! index so they follow edits the way inlay hints do. A plugin adds them
++//! (for example deleted lines of a diff under the line they used to follow,
++//! and a highlight on the lines that were added) and removes them again.
++
++use helix_core::doc_formatter::FormattedGrapheme;
++use helix_core::text_annotations::LineAnnotation;
++use helix_core::{Assoc, ChangeSet, Position, RopeSlice};
++use serde::Deserialize;
++
++#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
++pub struct VirtualSpan {
++    pub text: String,
++    /// Theme scope for this span, e.g. `diff.minus`; empty uses the row style.
++    #[serde(default)]
++    pub style: String,
++}
++
++#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
++pub struct VirtualLine {
++    /// Theme scope painted across the whole row first, e.g. `ui.virtual.diff.minus`.
++    #[serde(default)]
++    pub style: String,
++    #[serde(default)]
++    pub spans: Vec<VirtualSpan>,
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum VirtualItemKind {
++    /// Rows rendered below the line holding the anchor.
++    Lines(Vec<VirtualLine>),
++    /// A theme scope painted over the whole line holding the anchor.
++    LineHighlight(String),
++}
++
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct VirtualItem {
++    pub id: usize,
++    /// Char index; the item belongs to the document line containing it.
++    pub anchor: usize,
++    pub kind: VirtualItemKind,
++}
++
++#[derive(Debug, Default, Clone)]
++pub struct VirtualText {
++    items: Vec<VirtualItem>,
++    next_id: usize,
++}
++
++impl VirtualText {
++    pub fn is_empty(&self) -> bool {
++        self.items.is_empty()
++    }
++
++    pub fn items(&self) -> &[VirtualItem] {
++        &self.items
++    }
++
++    fn push(&mut self, anchor: usize, kind: VirtualItemKind) -> usize {
++        self.next_id += 1;
++        self.items.push(VirtualItem {
++            id: self.next_id,
++            anchor,
++            kind,
++        });
++        self.next_id
++    }
++
++    /// Rows shown below the line containing `anchor`. Returns an id for removal.
++    pub fn add_lines(&mut self, anchor: usize, lines: Vec<VirtualLine>) -> usize {
++        self.push(anchor, VirtualItemKind::Lines(lines))
++    }
++
++    /// Paints `style` (a theme scope) over the line containing `anchor`.
++    pub fn add_line_highlight(&mut self, anchor: usize, style: String) -> usize {
++        self.push(anchor, VirtualItemKind::LineHighlight(style))
++    }
++
++    pub fn remove(&mut self, id: usize) -> bool {
++        let before = self.items.len();
++        self.items.retain(|item| item.id != id);
++        before != self.items.len()
++    }
++
++    pub fn clear(&mut self) {
++        self.items.clear();
++    }
++
++    /// Keep anchors in place across an edit, like inlay hints.
++    pub fn map_changes(&mut self, changes: &ChangeSet) {
++        changes.update_positions(
++            self.items
++                .iter_mut()
++                .map(|item| (&mut item.anchor, Assoc::After)),
++        );
++    }
++
++    /// Row blocks keyed by the char index of the newline ending their line
++    /// (the text length for an unterminated last line), sorted by it.
++    pub fn blocks_by_line_end<'a>(&'a self, text: RopeSlice) -> Vec<(usize, &'a [VirtualLine])> {
++        let mut blocks: Vec<(usize, &[VirtualLine])> = self
++            .items
++            .iter()
++            .filter_map(|item| match &item.kind {
++                VirtualItemKind::Lines(lines) if !lines.is_empty() => {
++                    Some((line_end_char(text, item.anchor), lines.as_slice()))
++                }
++                _ => None,
++            })
++            .collect();
++        blocks.sort_by_key(|(end, _)| *end);
++        blocks
++    }
++
++    /// Highlighted document lines with their scopes, sorted by line.
++    pub fn line_highlights(&self, text: RopeSlice) -> Vec<(usize, &str)> {
++        let mut lines: Vec<(usize, &str)> = self
++            .items
++            .iter()
++            .filter_map(|item| match &item.kind {
++                VirtualItemKind::LineHighlight(style) => Some((
++                    text.char_to_line(item.anchor.min(text.len_chars())),
++                    style.as_str(),
++                )),
++                _ => None,
++            })
++            .collect();
++        lines.sort_by_key(|(line, _)| *line);
++        lines
++    }
++}
++
++/// Char index of the newline that ends the line containing `anchor`, or the
++/// text length when that is the last, unterminated line.
++pub fn line_end_char(text: RopeSlice, anchor: usize) -> usize {
++    let anchor = anchor.min(text.len_chars());
++    let line = text.char_to_line(anchor);
++    if line + 1 < text.len_lines() {
++        text.line_to_char(line + 1) - 1
++    } else {
++        text.len_chars()
++    }
++}
++
++/// Walks the sorted blocks alongside the document formatter: the newline
++/// grapheme of a block's line is its anchor; once that grapheme has been
++/// processed the block is pending and is emitted at that line's end. Used
++/// by both the layout side (`LineAnnotation`, reserving rows) and the
++/// render side (the decoration painting them), so the two always agree.
++pub struct VirtualLinesWalker<'a> {
++    blocks: Vec<(usize, &'a [VirtualLine])>,
++    idx: usize,
++    pending: Option<(usize, usize)>,
++}
++
++impl<'a> VirtualLinesWalker<'a> {
++    pub fn new(blocks: Vec<(usize, &'a [VirtualLine])>) -> Self {
++        VirtualLinesWalker {
++            blocks,
++            idx: 0,
++            pending: None,
++        }
++    }
++
++    /// Start a traversal at `char_idx`; returns the next anchor to watch.
++    pub fn reset(&mut self, char_idx: usize) -> usize {
++        self.pending = None;
++        self.idx = self.blocks.partition_point(|(end, _)| *end < char_idx);
++        self.next_anchor()
++    }
++
++    fn next_anchor(&self) -> usize {
++        self.blocks
++            .get(self.idx)
++            .map_or(usize::MAX, |(end, _)| *end)
++    }
++
++    /// The grapheme at `char_idx` was reached; returns the next anchor.
++    pub fn anchor_reached(&mut self, char_idx: usize) -> usize {
++        let start = self.idx;
++        while self
++            .blocks
++            .get(self.idx)
++            .is_some_and(|(end, _)| *end == char_idx)
++        {
++            self.idx += 1;
++        }
++        if self.idx > start {
++            self.pending = Some((start, self.idx));
++        }
++        self.next_anchor()
++    }
++
++    /// Rows for the line that just ended, if its anchor was reached.
++    pub fn take_pending(&mut self) -> Vec<&'a VirtualLine> {
++        match self.pending.take() {
++            Some((start, end)) => self.blocks[start..end]
++                .iter()
++                .flat_map(|(_, lines)| lines.iter())
++                .collect(),
++            None => Vec::new(),
++        }
++    }
++}
++
++/// Reserves the rows in the layout; the matching painter lives in helix-term.
++pub struct VirtualLinesAnnotation<'a> {
++    walker: VirtualLinesWalker<'a>,
++}
++
++impl<'a> VirtualLinesAnnotation<'a> {
++    pub fn new(blocks: Vec<(usize, &'a [VirtualLine])>) -> Self {
++        VirtualLinesAnnotation {
++            walker: VirtualLinesWalker::new(blocks),
++        }
++    }
++}
++
++impl LineAnnotation for VirtualLinesAnnotation<'_> {
++    fn reset_pos(&mut self, char_idx: usize) -> usize {
++        self.walker.reset(char_idx)
++    }
++
++    fn process_anchor(&mut self, grapheme: &FormattedGrapheme) -> usize {
++        self.walker.anchor_reached(grapheme.char_idx)
++    }
++
++    fn insert_virtual_lines(
++        &mut self,
++        _line_end_char_idx: usize,
++        _line_end_visual_pos: Position,
++        _doc_line: usize,
++    ) -> Position {
++        Position::new(self.walker.take_pending().len(), 0)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use helix_core::Rope;
++
++    fn line(text: &str) -> VirtualLine {
++        VirtualLine {
++            style: String::new(),
++            spans: vec![VirtualSpan {
++                text: text.to_string(),
++                style: String::new(),
++            }],
++        }
++    }
++
++    #[test]
++    fn blocks_are_keyed_by_their_lines_newline() {
++        let rope = Rope::from("ab\ncd\nef");
++        let mut vt = VirtualText::default();
++        let second = vt.add_lines(4, vec![line("x")]); // inside "cd"
++        vt.add_lines(0, vec![line("y"), line("z")]); // inside "ab"
++        vt.add_lines(7, vec![line("w")]); // inside "ef", no trailing newline
++        let blocks = vt.blocks_by_line_end(rope.slice(..));
++        assert_eq!(
++            blocks.iter().map(|(end, b)| (*end, b.len())).collect::<Vec<_>>(),
++            vec![(2, 2), (5, 1), (8, 1)]
++        );
++        assert!(vt.remove(second));
++        assert!(!vt.remove(second));
++        assert_eq!(vt.blocks_by_line_end(rope.slice(..)).len(), 2);
++    }
++
++    #[test]
++    fn walker_emits_once_per_anchored_line() {
++        let rope = Rope::from("ab\ncd\nef\n");
++        let mut vt = VirtualText::default();
++        vt.add_lines(3, vec![line("x")]);
++        vt.add_lines(4, vec![line("y")]);
++        let blocks = vt.blocks_by_line_end(rope.slice(..));
++        let mut walker = VirtualLinesWalker::new(blocks);
++        assert_eq!(walker.reset(0), 5);
++        assert!(walker.take_pending().is_empty());
++        // a soft-wrap point inside the line: nothing yet
++        assert_eq!(walker.anchor_reached(4), 5);
++        assert!(walker.take_pending().is_empty());
++        assert_eq!(walker.anchor_reached(5), usize::MAX);
++        assert_eq!(walker.take_pending().len(), 2);
++        assert!(walker.take_pending().is_empty());
++        // starting a traversal after the anchor skips it
++        assert_eq!(walker.reset(6), usize::MAX);
++    }
++
++    #[test]
++    fn anchors_follow_edits() {
++        let rope = Rope::from("ab\ncd\n");
++        let mut vt = VirtualText::default();
++        vt.add_line_highlight(3, "x".into());
++        let transaction = helix_core::Transaction::insert(&rope, &helix_core::Selection::point(0), "NEW\n".into());
++        vt.map_changes(transaction.changes());
++        let mut rope = rope;
++        transaction.apply(&mut rope);
++        assert_eq!(vt.line_highlights(rope.slice(..)), vec![(2, "x")]);
++    }
++}
+diff --git a/helix-view/src/document.rs b/helix-view/src/document.rs
+index 17d4002..3475c34 100644
+--- a/helix-view/src/document.rs
++++ b/helix-view/src/document.rs
+@@ -12,6 +12,7 @@
+ use helix_core::snippets::{ActiveSnippet, SnippetRenderCtx};
+ use helix_core::syntax::config::LanguageServerFeature;
+ use helix_core::text_annotations::{InlineAnnotation, Overlay};
++use crate::annotations::virtual_text::VirtualText;
+ use helix_event::TaskController;
+ use helix_lsp::util::lsp_pos_to_pos;
+ use helix_stdx::faccess::{copy_metadata, readonly};
+@@ -149,6 +150,8 @@ pub struct Document {
+     ///
+     /// To know if they're up-to-date, check the `id` field in `DocumentInlayHints`.
+     pub(crate) inlay_hints: HashMap<ViewId, DocumentInlayHints>,
++    /// Virtual text added by plugins (rows below lines, line highlights).
++    pub virtual_text: VirtualText,
+     /// Jump label overlays for each view.
+     pub(crate) jump_labels: HashMap<ViewId, Vec<Overlay>>,
+     /// LSP document highlights for each view, stored as char ranges.
+@@ -770,6 +773,7 @@ pub fn from(
+             focused_at: std::time::Instant::now(),
+             name: None,
+             readonly: false,
++            virtual_text: VirtualText::default(),
+             jump_labels: HashMap::new(),
+             document_highlights: HashMap::new(),
+             code_action_hints: HashSet::new(),
+@@ -1607,6 +1611,7 @@ fn apply_impl(
+             apply_inlay_hint_changes(other_inlay_hints);
+             apply_inlay_hint_changes(padding_after_inlay_hints);
+         }
++        self.virtual_text.map_changes(changes);
+ 
+         for highlights in self.document_highlights.values_mut() {
+             let text_len = self.text.len_chars();
+diff --git a/helix-view/src/view.rs b/helix-view/src/view.rs
+index d211d8e..2dfe94a 100644
+--- a/helix-view/src/view.rs
++++ b/helix-view/src/view.rs
+@@ -1,3 +1,4 @@
++use crate::annotations::virtual_text::VirtualLinesAnnotation;
+ use crate::{
+     align_view,
+     annotations::diagnostics::InlineDiagnostics,
+@@ -528,6 +529,12 @@ pub fn text_annotations<'a>(
+             ));
+         }
+ 
++        if !doc.virtual_text.is_empty() {
++            text_annotations.add_line_annotation(Box::new(VirtualLinesAnnotation::new(
++                doc.virtual_text.blocks_by_line_end(doc.text().slice(..)),
++            )));
++        }
++
+         text_annotations
+     }
+ 
