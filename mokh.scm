@@ -390,7 +390,9 @@
   (cond
     [id (handle-request id (or method "") params)]
     [(equal? method "ready")
-     (set! *port* (json-get params 'port #f))
+     ;; JSON numbers arrive as floats (41281.0); keep the port an integer.
+     (let ([port (json-get params 'port #f)])
+       (set! *port* (if (number? port) (exact (round port)) port)))
      (status "mokh: bridge ready, run /ide in Claude Code")]
     [(equal? method "connected")
      (set! *connections* (+ *connections* 1))
