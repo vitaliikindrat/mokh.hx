@@ -270,12 +270,12 @@
     [(equal? *inline* 'auto) (inline-available?)]
     [else (and *inline* (inline-available?))]))
 
-;; "@@ -12,5 +12,6 @@" -> 11 (0-based old start)
-(define (hunk-old-start line)
-  (let* ([rest (substring line 4 (string-length line))]
-         [range (car (split-many rest " "))]
-         [start (car (split-many range ","))])
-    (- (string->int start) 1)))
+;; "@@ -12,5 +12,6 @@" -> (11 . 11): 0-based old and new start lines
+(define (hunk-starts line)
+  (let* ([parts (split-many (substring line 3 (string-length line)) " ")]
+         [old (car (split-many (substring (car parts) 1 (string-length (car parts))) ","))]
+         [new (car (split-many (substring (cadr parts) 1 (string-length (cadr parts))) ","))])
+    (cons (max 0 (- (string->int old) 1)) (max 0 (- (string->int new) 1)))))
 
 ;; Unified diff text -> list of (hash 'old-start n 'ops (list (cons tag text) ...))
 ;; with tags 'ctx, 'del, 'add. Header lines before the first hunk are skipped.
@@ -290,7 +290,8 @@
            [(starts-with? line "@@ ")
             (loop (cdr lines)
                   (if cur (cons (finish cur) hunks) hunks)
-                  (hash 'old-start (max 0 (hunk-old-start line)) 'ops '()))]
+                  (let ([starts (hunk-starts line)])
+                    (hash 'old-start (car starts) 'new-start (cdr starts) 'ops '())))]
            [(not cur) (loop (cdr lines) hunks cur)]
            [(equal? line "") (loop (cdr lines) hunks cur)]
            [else
@@ -310,35 +311,49 @@
         'spans (list (hash 'text (string-append "+ " (string-replace text "\t" "    "))
                            'style "diff.plus"))))
 
-;; Render one hunk into the focused (old) buffer. Returns
-;; (cons first-changed-line item-ids).
+;; Render one hunk into the focused (old) buffer. A hunk can hold several
+;; change runs (del/add lines separated by context); each run is recorded
+;; as (old-line . new-line) so navigation and :mokh-edit go per change.
+;; Returns (cons changes item-ids) with changes a list of pairs.
 (define (render-hunk! hunk)
   (define old (hash-ref hunk 'old-start))
+  (define new (hash-ref hunk 'new-start))
   (define ids '())
   (define adds '())
-  (define first-change #f)
-  (define (note-change! line) (unless first-change (set! first-change line)))
+  (define changes '())
+  (define in-change #f)
+  (define (start-change! old-line new-line)
+    (unless in-change
+      (set! in-change #t)
+      (set! changes (cons (cons old-line new-line) changes))))
   (define (flush-adds!)
     (unless (null? adds)
       (let* ([anchor (max 0 (- old 1))]
              [json (value->jsexpr-string (map virtual-row (reverse adds)))]
              [id (vt-add-lines anchor json)])
-        (when id (set! ids (cons id ids)))
-        (note-change! anchor))
+        (when id (set! ids (cons id ids))))
       (set! adds '())))
   (for-each (lambda (op)
               (cond
-                [(equal? (car op) 'ctx) (flush-adds!) (set! old (+ old 1))]
+                [(equal? (car op) 'ctx)
+                 (flush-adds!)
+                 (set! in-change #f)
+                 (set! old (+ old 1))
+                 (set! new (+ new 1))]
                 [(equal? (car op) 'del)
                  (flush-adds!)
+                 (start-change! old new)
                  (let ([id (vt-add-highlight old "ui.virtual.diff.minus")])
                    (when id (set! ids (cons id ids))))
-                 (note-change! old)
                  (set! old (+ old 1))]
-                [else (set! adds (cons (cdr op) adds))]))
+                [else
+                 ;; an insertion lands below the previous old line
+                 (start-change! (max 0 (- old 1)) new)
+                 (set! adds (cons (cdr op) adds))
+                 (set! new (+ new 1))]))
             (hash-ref hunk 'ops))
   (flush-adds!)
-  (cons (or first-change (hash-ref hunk 'old-start)) ids))
+  (cons (reverse changes) ids))
 
 (define (goto-line! line)
   (helix.goto (number->string (+ 1 line)))
@@ -369,6 +384,7 @@
                      'doc #f
                      'items '()
                      'hunk-lines '()
+                     'hunk-new-lines '()
                      'origin origin
                      'status "pending"))
   (define record
@@ -377,10 +393,14 @@
           (helix.open old-path)
           (let* ([doc (editor->doc-id (editor-focus))]
                  [rendered (map render-hunk! (parse-unified-diff diff))]
-                 [lines (map car rendered)]
+                 [changes (apply append (map car rendered))]
+                 [lines (map car changes)]
+                 [new-lines (map cdr changes)]
                  [ids (apply append (map cdr rendered))])
             (unless (null? lines) (goto-line! (car lines)))
-            (hash-insert (hash-insert (hash-insert base 'doc doc) 'items ids) 'hunk-lines lines)))
+            (hash-insert (hash-insert (hash-insert (hash-insert base 'doc doc) 'items ids)
+                                      'hunk-lines lines)
+                         'hunk-new-lines new-lines)))
         (begin
           (helix.vsplit-new)
           (set-scratch-buffer-name! (string-append "[mokh] " (file-name new-path)))
@@ -394,7 +414,9 @@
               [(null? lines) void]
               [(starts-with? (car lines) "@@ ") (goto-line! i)]
               [else (loop (cdr lines) (+ i 1))]))
-          (hash-insert base 'diff-doc (editor->doc-id (editor-focus))))))
+          (let ([hunks (parse-unified-diff diff)])
+            (hash-insert (hash-insert base 'diff-doc (editor->doc-id (editor-focus)))
+                         'hunk-new-lines (map (lambda (h) (hash-ref h 'new-start)) hunks))))))
   (set! *diffs* (hash-insert *diffs* tab record))
   (status (diff-summary (file-name new-path) (exact (round added)) (exact (round removed))))
   #f)
@@ -432,7 +454,10 @@
                         [(equal? direction 'next) (apply min candidates)]
                         [else (apply max candidates)])])
          (with-doc-focused (hash-ref d 'doc) (lambda () void))
-         (goto-line! target))])))
+         (goto-line! target)
+         (status (string-append "mokh: hunk "
+                                (number->string (+ 1 (length (filter (lambda (l) (< l target)) lines))))
+                                "/" (number->string (length lines)))))])))
 
 (define (same-doc? a b)
   (and a b (equal? (doc-id->usize a) (doc-id->usize b))))
@@ -460,11 +485,13 @@
       [(hash-ref d 'proposal-doc)
        (editor-set-focus! (or (editor-doc-in-view? (hash-ref d 'proposal-doc)) (editor-focus)))]
       [else
-       (let ([diff-view (and (hash-ref d 'diff-doc) (editor-doc-in-view? (hash-ref d 'diff-doc)))])
+       (let ([diff-view (and (hash-ref d 'diff-doc) (editor-doc-in-view? (hash-ref d 'diff-doc)))]
+             [target (edit-target-line d)])
          (if diff-view
              (editor-set-focus! diff-view) ; reuse the diff window
              (helix.vsplit))
          (helix.open (hash-ref d 'proposal))
+         (when target (goto-line! target))
          (set! *diffs*
                (hash-insert *diffs* (hash-ref d 'tab)
                             (hash-insert d 'proposal-doc (editor->doc-id (editor-focus))))))])))
@@ -704,3 +731,21 @@
 
 (register-hook 'selection-did-change (lambda (_view) (push-selection!)))
 (register-hook 'document-saved on-document-saved)
+
+;; Where in the proposal to put the cursor for :mokh-edit: the hunk the
+;; cursor is on in the inline review (the last one starting at or before
+;; it), else the first hunk.
+(define (edit-target-line d)
+  (let ([olds (hash-ref d 'hunk-lines)] [news (hash-ref d 'hunk-new-lines)])
+    (cond
+      [(null? news) #f]
+      [else
+       (let* ([on-old-doc (and (hash-ref d 'doc)
+                               (same-doc? (editor->doc-id (editor-focus)) (hash-ref d 'doc)))]
+              [here (if on-old-doc (helix.static.get-current-line-number) -1)]
+              [idx (let loop ([i 0] [best 0])
+                     (cond
+                       [(>= i (length olds)) best]
+                       [(<= (list-ref olds i) here) (loop (+ i 1) i)]
+                       [else (loop (+ i 1) best)]))])
+         (list-ref news (min idx (- (length news) 1))))])))
