@@ -10,6 +10,7 @@
          selection-json
          empty-selection-json
          at-mention-json
+         at-mention-file-json
          open-editors-json
          diff-summary
          mcp-text
@@ -68,6 +69,10 @@
 
 (define (at-mention-json path line-start line-end)
   (hash 'filePath path 'lineStart line-start 'lineEnd line-end))
+
+;; A whole file as an @-mention: no line range.
+(define (at-mention-file-json path)
+  (hash 'filePath path))
 
 ;; entries: list of (list path is-active language is-dirty)
 (define (open-editors-json entries)

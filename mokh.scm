@@ -27,6 +27,7 @@
          mokh-stop
          mokh-status
          mokh-send
+         mokh-send-file
          mokh-accept
          mokh-reject
          mokh-edit
@@ -37,13 +38,15 @@
 (define *bridge-command* "mokh-bridge")
 (define *ide-name* "Helix")
 (define *diff-root* "/tmp/mokh-hx")
-(define *track-selection* #t)
+;; Off by default: with it on, Claude's prompt always shows "in <file>" for
+;; whatever buffer is focused. `mokh-send` / `mokh-send-file` are explicit.
+(define *track-selection* #f)
 
 ;;@doc
 ;; Configure mokh before `mokh-start`. Keywords: #:bridge (path to
 ;; mokh-bridge), #:ide-name (what Claude's /ide shows), #:diff-root
 ;; (where proposal files are written), #:track-selection (push the
-;; selection to Claude as you move, default #t).
+;; selection to Claude as you move, default #f).
 (define (mokh-configure! #:bridge (bridge #f)
                          #:ide-name (ide-name #f)
                          #:diff-root (diff-root #f)
@@ -519,6 +522,20 @@
              (notify! "at_mentioned" (at-mention-json (hash-ref sel 'filePath) start end))
              (status (string-append "mokh: sent " (file-name (hash-ref sel 'filePath))
                                     ":" (number->string (+ 1 start)) "-" (number->string (+ 1 end)))))))]))
+
+;;@doc
+;; Send the focused file to Claude Code as an @-mention (whole file)
+(define (mokh-send-file)
+  (cond
+    [(not (running?)) (status "mokh: not running (:mokh-start)")]
+    [(= *connections* 0) (status "mokh: no Claude session attached (run /ide in Claude Code)")]
+    [else
+     (let ([path (doc-path (editor->doc-id (editor-focus)))])
+       (if (not path)
+           (status "mokh: the focused buffer has no file")
+           (begin
+             (notify! "at_mentioned" (at-mention-file-json path))
+             (status (string-append "mokh: sent " (file-name path))))))]))
 
 ;;;; hooks
 

@@ -16,8 +16,9 @@ the real CLI; the diff UI is the first, split-based version.
 ## What you get
 
 - `/ide` in Claude Code lists **Helix** and connects to it.
-- Claude knows the file and lines you are looking at (`selection_changed`),
-  and `:mokh-send` pushes the current selection as an `@`-mention.
+- `:mokh-send` pushes the current selection to Claude as an `@`-mention,
+  `:mokh-send-file` the whole file. Live selection tracking
+  (`selection_changed`) is available but off by default.
 - `openFile` from Claude opens the file in Helix and jumps to the text it
   names.
 - `openDiff` opens the unified diff of Claude's proposed change in a vertical
@@ -57,10 +58,11 @@ Then in `~/.config/helix/init.scm`:
 (require "mokh/mokh.scm")
 
 ;; Optional. Defaults: "mokh-bridge" from PATH, IDE name "Helix",
-;; proposals under /tmp/mokh-hx, selection tracking on.
+;; proposals under /tmp/mokh-hx, selection tracking off (with it on, Claude's
+;; prompt shows "in <file>" for whatever buffer is focused).
 (mokh-configure! #:bridge "/path/to/mokh-bridge"
                  #:ide-name "Helix"
-                 #:track-selection #t)
+                 #:track-selection #f)
 
 ;; Start on launch, or bind :mokh-start to a key and start on demand.
 (mokh-start)
@@ -68,6 +70,7 @@ Then in `~/.config/helix/init.scm`:
 (require (only-in "helix/keymaps.scm" keymap))
 (keymap (global)
         (normal (space (m (s ":mokh-send")
+                          (f ":mokh-send-file")
                           (a ":mokh-accept")
                           (r ":mokh-reject")
                           (e ":mokh-edit")
@@ -85,6 +88,7 @@ reports `mokh: Claude Code connected`.
 | `:mokh-stop` | Stop it; pending diffs are rejected, the lock file removed |
 | `:mokh-status` | Port, attached Claude sessions, pending diffs |
 | `:mokh-send` | Send the primary selection to Claude as an `@`-mention (file and line range) |
+| `:mokh-send-file` | Send the focused file to Claude as an `@`-mention |
 | `:mokh-accept` | Accept the diff under the cursor (or the only pending one) with the proposal buffer's current text |
 | `:mokh-reject` | Reject it |
 | `:mokh-edit` | Open the proposal as an editable buffer below the diff; its text is what accept sends |

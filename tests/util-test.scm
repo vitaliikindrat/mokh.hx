@@ -33,6 +33,7 @@
 (check "json-string non-string -> #f" (json-string (hash-ref parsed 'params) 'flag) #f)
 
 (check "at-mention" (hash-ref (at-mention-json "/p/a.rs" 3 9) 'lineEnd) 9)
+(check "at-mention file has no range" (hash-contains? (at-mention-file-json "/p/a.rs") 'lineStart) #f)
 (define editors (open-editors-json (list (list "/p/a.rs" #t "rust" #f) (list "/p/b.md" #f "markdown" #t))))
 (check "open editors label" (hash-ref (car (hash-ref editors 'tabs)) 'label) "a.rs")
 (check "open editors dirty" (hash-ref (cadr (hash-ref editors 'tabs)) 'isDirty) #t)
