@@ -227,15 +227,29 @@
              (helix.quit!))))
      (hash 'success #t 'filePath path 'saved #t 'message "Document saved successfully")]))
 
+;; Claude writes the file after FILE_SAVED and then calls close_tab; that is
+;; the moment to reload the buffer so it shows what landed on disk.
+(define *written* (hash)) ; tab -> path of a diff resolved since the last close_tab
+
+(define (reload-if-clean! path)
+  (let ([doc (and path (find-doc-by-path path))])
+    (when (and doc (not (editor-document-dirty? doc)))
+      (editor-document-reload doc))))
+
 (define (tool-close-tab id params)
   (define tab (json-string params 'tab_name))
   (when (and tab (hash-contains? *diffs* tab))
     (close-diff! tab))
+  (when (and tab (hash-contains? *written* tab))
+    (reload-if-clean! (hash-ref *written* tab))
+    (set! *written* (hash-remove *written* tab)))
   "TAB_CLOSED")
 
 (define (tool-close-all-diffs id params)
   (define n (length (hash-keys->list *diffs*)))
   (for-each (lambda (tab) (close-diff! tab)) (hash-keys->list *diffs*))
+  (for-each (lambda (tab) (reload-if-clean! (hash-ref *written* tab))) (hash-keys->list *written*))
+  (set! *written* (hash))
   (string-append "CLOSED_" (number->string n) "_DIFF_TABS"))
 
 ;;;; openDiff. Two renderings:
@@ -397,6 +411,9 @@
        (hash-insert base 'proposal-doc (editor->doc-id (editor-focus)))]
       [(inline-enabled?)
        (helix.open old-path)
+       ;; the diff was computed against the file on disk; a buffer that is
+       ;; behind it (a previous accepted edit) would put the rows on the wrong lines
+       (reload-if-clean! old-path)
           (let* ([doc (editor->doc-id (editor-focus))]
                  [rendered (map render-hunk! (parse-unified-diff diff))]
                  [changes (apply append (map car rendered))]
@@ -532,6 +549,7 @@
     (set! *diffs* (hash-insert *diffs* tab (hash-insert d 'status outcome)))
     (if (equal? outcome "accepted")
         (let ([content (diff-final-text d)])
+          (set! *written* (hash-insert *written* tab (hash-ref d 'old-path)))
           (reply! (hash-ref d 'id) (mcp-content (mcp-text "FILE_SAVED") (mcp-text content)))
           (status (string-append "mokh: accepted " (file-name (hash-ref d 'new-path)))))
         (begin
