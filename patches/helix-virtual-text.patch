@@ -117,7 +117,7 @@ index e017874..e4daa0c 100644
 +    doc.virtual_text.clear();
 +}
 diff --git a/helix-term/src/ui/editor.rs b/helix-term/src/ui/editor.rs
-index f2f8412..abfcc38 100644
+index f2f8412..c9e70b8 100644
 --- a/helix-term/src/ui/editor.rs
 +++ b/helix-term/src/ui/editor.rs
 @@ -8,7 +8,7 @@
@@ -134,7 +134,7 @@ index f2f8412..abfcc38 100644
                  config.end_of_line_diagnostics,
              ));
 +            if !doc.virtual_text.is_empty() {
-+                decorations.add_decoration(VirtualTextDecoration::new(doc, theme));
++                decorations.add_decoration(VirtualTextDecoration::new(doc, theme, inner.width as usize));
 +            }
              render_document(
                  surface,
@@ -156,16 +156,16 @@ index 7aef472..9a5c2db 100644
  ///
 diff --git a/helix-term/src/ui/text_decorations/virtual_text.rs b/helix-term/src/ui/text_decorations/virtual_text.rs
 new file mode 100644
-index 0000000..d47c7e7
+index 0000000..654e363
 --- /dev/null
 +++ b/helix-term/src/ui/text_decorations/virtual_text.rs
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,138 @@
 +//! Paints plugin virtual text: rows reserved by
 +//! [`VirtualLinesAnnotation`](helix_view::annotations::virtual_text::VirtualLinesAnnotation)
 +//! and whole-line highlights.
 +
 +use helix_core::doc_formatter::FormattedGrapheme;
-+use helix_core::unicode::width::UnicodeWidthStr;
++use helix_core::unicode::width::UnicodeWidthChar;
 +use helix_core::Position;
 +use helix_view::annotations::virtual_text::VirtualLinesWalker;
 +use helix_view::graphics::Rect;
@@ -179,10 +179,13 @@ index 0000000..d47c7e7
 +    walker: VirtualLinesWalker<'a>,
 +    highlights: Vec<(usize, Style)>,
 +    theme: &'a Theme,
++    /// Text area width; long rows wrap at it, matching the rows the
++    /// annotation reserved.
++    viewport_width: usize,
 +}
 +
 +impl<'a> VirtualTextDecoration<'a> {
-+    pub fn new(doc: &'a Document, theme: &'a Theme) -> Self {
++    pub fn new(doc: &'a Document, theme: &'a Theme, viewport_width: usize) -> Self {
 +        let text = doc.text().slice(..);
 +        VirtualTextDecoration {
 +            walker: VirtualLinesWalker::new(doc.virtual_text.blocks_by_line_end(text)),
@@ -193,6 +196,7 @@ index 0000000..d47c7e7
 +                .map(|(line, scope)| (line, theme.get(scope)))
 +                .collect(),
 +            theme,
++            viewport_width,
 +        }
 +    }
 +}
@@ -235,35 +239,63 @@ index 0000000..d47c7e7
 +            return Position::new(0, 0);
 +        }
 +        let viewport = renderer.viewport;
++        let width = self.viewport_width.max(1);
 +        let last_row = (renderer.offset.row + viewport.height as usize) as u16;
-+        let mut row = pos.visual_line + virt_off.row as u16;
++        let first_row = pos.visual_line + virt_off.row as u16;
++        let mut row = first_row;
++        let mut reserved = 0usize;
 +        for line in &lines {
-+            if row >= last_row {
-+                break;
-+            }
++            let rows = line.rows(width);
++            reserved += rows;
++            let row_end = row + rows as u16; // rows this line may use
 +            let row_style = if line.style.is_empty() {
 +                Style::default()
 +            } else {
 +                self.theme.get(&line.style)
 +            };
-+            renderer.set_style(Rect::new(viewport.x, row, viewport.width, 1), row_style);
++            for r in row..row_end.min(last_row) {
++                renderer.set_style(Rect::new(viewport.x, r, viewport.width, 1), row_style);
++            }
++            // Wrap at `width` columns, one grapheme at a time, exactly as
++            // `VirtualLine::rows` counted.
 +            let mut col = 0usize;
++            let mut buf = String::new();
++            let mut buf_col = 0usize;
 +            for span in &line.spans {
-+                if col >= viewport.width as usize {
-+                    break;
-+                }
 +                let style = if span.style.is_empty() {
 +                    row_style
 +                } else {
 +                    row_style.patch(self.theme.get(&span.style))
 +                };
-+                let remaining = viewport.width as usize - col;
-+                renderer.set_stringn(viewport.x + col as u16, row, &span.text, remaining, style);
-+                col += span.text.width();
++                for ch in span.text.chars() {
++                    let cw = ch.width().unwrap_or(0);
++                    if col + cw > width && col > 0 {
++                        if row < last_row {
++                            renderer.set_stringn(viewport.x + buf_col as u16, row, &buf, width - buf_col, style);
++                        }
++                        buf.clear();
++                        row += 1;
++                        col = 0;
++                        buf_col = 0;
++                        if row >= row_end {
++                            break;
++                        }
++                    }
++                    buf.push(ch);
++                    col += cw;
++                }
++                if row >= row_end {
++                    break;
++                }
++                if !buf.is_empty() && row < last_row {
++                    renderer.set_stringn(viewport.x + buf_col as u16, row, &buf, width - buf_col, style);
++                }
++                buf_col = col;
++                buf.clear();
 +            }
-+            row += 1;
++            row = row_end;
 +        }
-+        Position::new(lines.len(), 0)
++        Position::new(reserved, 0)
 +    }
 +}
 diff --git a/helix-view/src/annotations.rs b/helix-view/src/annotations.rs
@@ -275,10 +307,10 @@ index 4c63048..6e6274d 100644
 +pub mod virtual_text;
 diff --git a/helix-view/src/annotations/virtual_text.rs b/helix-view/src/annotations/virtual_text.rs
 new file mode 100644
-index 0000000..070bb1f
+index 0000000..42a9735
 --- /dev/null
 +++ b/helix-view/src/annotations/virtual_text.rs
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,338 @@
 +//! Plugin-provided virtual text: blocks of styled rows rendered below a
 +//! document line, and whole-line highlights. Items are anchored by char
 +//! index so they follow edits the way inlay hints do. A plugin adds them
@@ -287,6 +319,7 @@ index 0000000..070bb1f
 +
 +use helix_core::doc_formatter::FormattedGrapheme;
 +use helix_core::text_annotations::LineAnnotation;
++use helix_core::unicode::width::UnicodeWidthStr;
 +use helix_core::{Assoc, ChangeSet, Position, RopeSlice};
 +use serde::Deserialize;
 +
@@ -305,6 +338,22 @@ index 0000000..070bb1f
 +    pub style: String,
 +    #[serde(default)]
 +    pub spans: Vec<VirtualSpan>,
++}
++
++impl VirtualLine {
++    /// Display width of the whole line.
++    pub fn width(&self) -> usize {
++        self.spans.iter().map(|s| s.text.width()).sum()
++    }
++
++    /// Screen rows the line takes when wrapped at `viewport_width` columns;
++    /// the painter wraps the same way, so layout and rendering agree.
++    pub fn rows(&self, viewport_width: usize) -> usize {
++        if viewport_width == 0 {
++            return 1;
++        }
++        self.width().div_ceil(viewport_width).max(1)
++    }
 +}
 +
 +#[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,14 +535,17 @@ index 0000000..070bb1f
 +}
 +
 +/// Reserves the rows in the layout; the matching painter lives in helix-term.
++/// `viewport_width` is the text area width the painter wraps at.
 +pub struct VirtualLinesAnnotation<'a> {
 +    walker: VirtualLinesWalker<'a>,
++    viewport_width: usize,
 +}
 +
 +impl<'a> VirtualLinesAnnotation<'a> {
-+    pub fn new(blocks: Vec<(usize, &'a [VirtualLine])>) -> Self {
++    pub fn new(blocks: Vec<(usize, &'a [VirtualLine])>, viewport_width: usize) -> Self {
 +        VirtualLinesAnnotation {
 +            walker: VirtualLinesWalker::new(blocks),
++            viewport_width,
 +        }
 +    }
 +}
@@ -513,7 +565,13 @@ index 0000000..070bb1f
 +        _line_end_visual_pos: Position,
 +        _doc_line: usize,
 +    ) -> Position {
-+        Position::new(self.walker.take_pending().len(), 0)
++        let rows = self
++            .walker
++            .take_pending()
++            .iter()
++            .map(|line| line.rows(self.viewport_width))
++            .sum();
++        Position::new(rows, 0)
 +    }
 +}
 +
@@ -570,6 +628,16 @@ index 0000000..070bb1f
 +    }
 +
 +    #[test]
++    fn long_lines_wrap_into_several_rows() {
++        let l = line(&"x".repeat(25));
++        assert_eq!(l.rows(10), 3);
++        assert_eq!(l.rows(25), 1);
++        assert_eq!(l.rows(100), 1);
++        assert_eq!(line("").rows(10), 1);
++        assert_eq!(l.rows(0), 1);
++    }
++
++    #[test]
 +    fn anchors_follow_edits() {
 +        let rope = Rope::from("ab\ncd\n");
 +        let mut vt = VirtualText::default();
@@ -619,7 +687,7 @@ index 17d4002..3475c34 100644
          for highlights in self.document_highlights.values_mut() {
              let text_len = self.text.len_chars();
 diff --git a/helix-view/src/view.rs b/helix-view/src/view.rs
-index d211d8e..2dfe94a 100644
+index d211d8e..21b813d 100644
 --- a/helix-view/src/view.rs
 +++ b/helix-view/src/view.rs
 @@ -1,3 +1,4 @@
@@ -627,13 +695,14 @@ index d211d8e..2dfe94a 100644
  use crate::{
      align_view,
      annotations::diagnostics::InlineDiagnostics,
-@@ -528,6 +529,12 @@ pub fn text_annotations<'a>(
+@@ -528,6 +529,13 @@ pub fn text_annotations<'a>(
              ));
          }
  
 +        if !doc.virtual_text.is_empty() {
 +            text_annotations.add_line_annotation(Box::new(VirtualLinesAnnotation::new(
 +                doc.virtual_text.blocks_by_line_end(doc.text().slice(..)),
++                width as usize,
 +            )));
 +        }
 +

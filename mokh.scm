@@ -482,8 +482,15 @@
   (let ([d (current-diff)])
     (cond
       [(not d) (status "mokh: no pending diff here")]
-      [(hash-ref d 'proposal-doc)
-       (editor-set-focus! (or (editor-doc-in-view? (hash-ref d 'proposal-doc)) (editor-focus)))]
+      ;; Open in a window: go there. Open but hidden (the user closed its
+      ;; window): show it here. Closed with :bc: it no longer exists, reopen below.
+      [(and (hash-ref d 'proposal-doc)
+            (editor-doc-exists? (hash-ref d 'proposal-doc))
+            (editor-doc-in-view? (hash-ref d 'proposal-doc)))
+       (editor-set-focus! (editor-doc-in-view? (hash-ref d 'proposal-doc)))]
+      [(and (hash-ref d 'proposal-doc) (editor-doc-exists? (hash-ref d 'proposal-doc)))
+       (editor-switch! (hash-ref d 'proposal-doc))
+       (let ([target (edit-target-line d)]) (when target (goto-line! target)))]
       [else
        (let ([diff-view (and (hash-ref d 'diff-doc) (editor-doc-in-view? (hash-ref d 'diff-doc)))]
              [target (edit-target-line d)])
