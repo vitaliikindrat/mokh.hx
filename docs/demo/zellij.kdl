@@ -1,0 +1,14 @@
+// zellij config for the demo recording: locked mode so every key goes to
+// the focused pane (hx), no status bar plugins, no startup tips.
+default_mode "locked"
+pane_frames true
+simplified_ui true
+default_shell "bash"
+show_startup_tips false
+show_release_notes false
+ui {
+    pane_frames {
+        rounded_corners true
+        hide_session_name true
+    }
+}

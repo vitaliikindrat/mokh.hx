@@ -3,6 +3,14 @@
 Claude Code IDE integration for [Helix](https://helix-editor.com), as a
 [Steel](https://github.com/mattwparas/steel) plugin. Moss on the forest floor.
 
+![Claude Code editing a file, reviewed inline in Helix](docs/demo.gif)
+
+*A real Claude Code (Haiku) session on the right, connected through `/ide`. Its
+edits show up inline in the buffer on the left: the deleted line highlighted,
+the added line as a green row under it. `space m a` accepts, `space m r`
+rejects. Rendered from `docs/demo.tape` with VHS; `docs/demo/run.sh` sets
+up the throwaway project and the isolated Claude config it uses.*
+
 Claude Code can attach to an editor the way it attaches to VS Code or
 JetBrains: it learns what you have selected, opens files for you, and shows
 each edit as a diff you accept or reject before it is written. mokh.hx gives
