@@ -388,9 +388,15 @@
                      'origin origin
                      'status "pending"))
   (define record
-    (if (and (inline-enabled?) (path-exists? old-path))
-        (begin
-          (helix.open old-path)
+    (cond
+      ;; A new file: nothing to diff against, show the file itself, editable.
+      [(not (path-exists? old-path))
+       (helix.vsplit)
+       (helix.open proposal)
+       (helix.static.goto_file_start)
+       (hash-insert base 'proposal-doc (editor->doc-id (editor-focus)))]
+      [(inline-enabled?)
+       (helix.open old-path)
           (let* ([doc (editor->doc-id (editor-focus))]
                  [rendered (map render-hunk! (parse-unified-diff diff))]
                  [changes (apply append (map car rendered))]
@@ -400,8 +406,8 @@
             (unless (null? lines) (goto-line! (car lines)))
             (hash-insert (hash-insert (hash-insert (hash-insert base 'doc doc) 'items ids)
                                       'hunk-lines lines)
-                         'hunk-new-lines new-lines)))
-        (begin
+                         'hunk-new-lines new-lines))]
+      [else
           (helix.vsplit-new)
           (set-scratch-buffer-name! (string-append "[mokh] " (file-name new-path)))
           (helix.static.insert_string diff)
@@ -416,9 +422,11 @@
               [else (loop (cdr lines) (+ i 1))]))
           (let ([hunks (parse-unified-diff diff)])
             (hash-insert (hash-insert base 'diff-doc (editor->doc-id (editor-focus)))
-                         'hunk-new-lines (map (lambda (h) (hash-ref h 'new-start)) hunks))))))
+                         'hunk-new-lines (map (lambda (h) (hash-ref h 'new-start)) hunks)))]))
   (set! *diffs* (hash-insert *diffs* tab record))
-  (status (diff-summary (file-name new-path) (exact (round added)) (exact (round removed))))
+  (status (if (path-exists? old-path)
+              (diff-summary (file-name new-path) (exact (round added)) (exact (round removed)))
+              (string-append "mokh: new file " (file-name new-path) " (" (number->string (exact (round added))) " lines) | :mokh-accept (or :w) / :mokh-reject")))
   #f)
 
 ;; Run thunk with `doc` focused in some window (its own, or the current one).
