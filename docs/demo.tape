@@ -28,13 +28,24 @@ Show
 
 # the first edit appears inline, cursor on the change
 Sleep 3.5s
-Type " mn"
+
+# every chord is shown deliberately: `space m` opens the menu with the mokh
+# commands and their descriptions, then the letter picks one
+Type " m"
+Sleep 800ms
+Type "n"
 Sleep 1.5s
-Type " mp"
+Type " m"
+Sleep 800ms
+Type "p"
 Sleep 1.5s
 # accept: Claude writes the file and sends the next edit
-Type " ma"
+Type " m"
+Sleep 800ms
+Type "a"
 Sleep 4s
 # reject this one
-Type " mr"
+Type " m"
+Sleep 800ms
+Type "r"
 Sleep 3.5s
