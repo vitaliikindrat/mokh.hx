@@ -1,4 +1,4 @@
-# Renders docs/demo.gif with VHS (https://github.com/charmbracelet/vhs):
+# Renders docs/demo-review.gif with VHS (https://github.com/charmbracelet/vhs):
 #
 #   HX=/path/to/steel/hx vhs docs/demo.tape
 #
@@ -7,7 +7,7 @@
 # render catches a slow response the keys land before the diff and the
 # status line says "no pending diff here" -- just render again.
 
-Output docs/demo.gif
+Output docs/demo-review.gif
 
 Set Shell "bash"
 Set FontFamily "JetBrainsMono Nerd Font"

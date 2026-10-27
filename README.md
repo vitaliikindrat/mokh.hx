@@ -3,7 +3,7 @@
 Claude Code IDE integration for [Helix](https://helix-editor.com), as a
 [Steel](https://github.com/mattwparas/steel) plugin. Moss on the forest floor.
 
-![Claude Code editing a file, reviewed inline in Helix](docs/demo.gif)
+![Claude Code editing a file, reviewed inline in Helix](docs/demo-review.gif)
 
 *A real Claude Code (Haiku) session on the right, connected through `/ide`. Its
 edits show up inline in the buffer on the left: the deleted line highlighted,
