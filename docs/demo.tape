@@ -3,38 +3,38 @@
 #   HX=/path/to/steel/hx vhs docs/demo.tape
 #
 # A real Claude Code (Haiku) session edits app.py; the review happens in hx.
-# Timings are generous because the model's response time varies.
+# Haiku answers within a couple of seconds, so the waits are short; if a
+# render catches a slow response the keys land before the diff and the
+# status line says "no pending diff here" -- just render again.
 
 Output docs/demo.gif
 
 Set Shell "bash"
 Set FontFamily "JetBrainsMono Nerd Font"
-Set FontSize 15
-Set Width 1400
-Set Height 780
-Set Padding 10
+Set FontSize 18
+Set Width 1300
+Set Height 720
+Set Padding 8
 Set Framerate 20
-Set TypingSpeed 80ms
+Set TypingSpeed 25ms
 Set Theme "Catppuccin Mocha"
 
 Hide
 Type "bash docs/demo/run.sh"
 Enter
+# zellij + hx + bridge up, Claude connected and already working
 Sleep 9s
 Show
 
-# Claude connects (status: "mokh: Claude Code connected") and sends its first
-# edit; it shows up inline in the real buffer, cursor on the change.
-Sleep 16s
-
-# next change / previous change, then accept: Claude writes the file.
+# the first edit appears inline, cursor on the change
+Sleep 3.5s
 Type " mn"
-Sleep 2s
+Sleep 1.5s
 Type " mp"
-Sleep 2s
+Sleep 1.5s
+# accept: Claude writes the file and sends the next edit
 Type " ma"
-Sleep 12s
-
-# the second edit arrives; reject it this time
+Sleep 4s
+# reject this one
 Type " mr"
-Sleep 10s
+Sleep 3.5s
