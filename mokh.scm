@@ -18,6 +18,8 @@
 (require (prefix-in helix. "helix/commands.scm"))
 (require (prefix-in helix.static. "helix/static.scm"))
 (require-builtin helix/core/text as text.)
+(require (prefix-in th. "helix/themes.scm"))
+(require (prefix-in hc. "helix/components.scm"))
 (require-builtin steel/process)
 (require-builtin steel/threads)
 (require-builtin steel/time)
@@ -275,6 +277,63 @@
 (define vt-add-lines (lookup-virtual-text "add-virtual-lines"))
 (define vt-add-highlight (lookup-virtual-text "add-line-highlight"))
 (define vt-remove (lookup-virtual-text "remove-virtual-text"))
+
+;;;; colours inherited from the theme
+;;
+;; A theme that sets these scopes itself keeps them. For one that does not,
+;; they are mixed from colours it does set, again whenever the theme changes.
+;; Needs dna.hx's helix-theme.patch; looked up so this file loads without it
+;; (the scopes then stay whatever the theme says).
+
+(define (theme-api name)
+  (with-handler (lambda (_) #f)
+                (eval-string (string-append "(require-builtin helix/core/themes as th.) th." name))))
+(define th-style-exact (theme-api "theme-style-exact"))
+(define th-color-mix (theme-api "color-mix"))
+(define th-color->rgb (theme-api "color->rgb"))
+(define th-set-style! (theme-api "set-current-theme-style!"))
+(define (theme-api?)
+  (and (function? th-style-exact) (function? th-color-mix)
+       (function? th-color->rgb) (function? th-set-style!)))
+
+(define (fg-of theme scope) (hc.style->fg (th.theme-style theme scope)))
+
+;; What colours are mixed over: the theme's background, or, for a theme that
+;; leaves it to the terminal, black or white, whichever its text is not.
+(define (theme-base theme)
+  (or (hc.style->bg (th.theme-style theme "ui.background"))
+      (let* ([fg (fg-of theme "ui.text")]
+             [rgb (and fg (th-color->rgb fg))])
+        (if (and rgb
+                 (< (+ (* 299 (list-ref rgb 0)) (* 587 (list-ref rgb 1)) (* 114 (list-ref rgb 2)))
+                    128000))
+            hc.Color/White
+            hc.Color/Black))))
+
+;; Give `scope` the fraction `fg` of `color` over `base` as its text and `bg`
+;; as its background (#false leaves that side unset), unless the theme sets
+;; `scope` itself.
+(define (inherit! theme base scope color fg bg)
+  (when (and color (not (th-style-exact theme scope)))
+    (let* ([fg (and fg (th-color-mix color base fg))]
+           [bg (and bg (th-color-mix color base bg))]
+           [s (hc.style)]
+           [s (if fg (hc.style-fg s fg) s)]
+           [s (if bg (hc.style-bg s bg) s)])
+      (th-set-style! scope s))))
+
+;; Removed and added lines: a fifth of the theme's diff.minus / diff.plus
+;; over its background, the way most editors tint diffs.
+(define (inherit-colors!)
+  (when (theme-api?)
+    (let* ([theme (th.current-theme)]
+           [base (theme-base theme)])
+      (inherit! theme base "ui.virtual.diff.minus" (fg-of theme "diff.minus") #f 0.2)
+      (inherit! theme base "ui.virtual.diff.plus" (fg-of theme "diff.plus") #f 0.2))))
+
+(when (theme-api?)
+  (register-hook 'theme-changed inherit-colors!)
+  (inherit-colors!))
 
 (define (inline-available?)
   (and (function? vt-add-lines) (function? vt-add-highlight) (function? vt-remove)))

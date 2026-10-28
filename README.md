@@ -143,18 +143,20 @@ line highlights, one `LineAnnotation` that reserves the rows (so cursor
 movement and scrolling skip them, like inline diagnostics) and one
 `Decoration` that paints them, exposed to Steel as `add-virtual-lines`,
 `add-line-highlight`, `remove-virtual-text` and `clear-virtual-text` in
-`helix/misc.scm`. It lives in [canopy.hx](https://github.com/vitaliikindrat/canopy.hx)
+`helix/misc.scm`. It lives in [dna.hx](https://github.com/vitaliikindrat/dna.hx)
 as `helix-virtual-text.patch` (about 350 additive lines, against
 `mattwparas/helix` at `424add1`), with the other Steel plugin APIs. Apply it
-to your Steel build; with Nix, add `inputs.canopy.patches.virtual-text` to
+to your Steel build; with Nix, add `inputs.dna.patches.virtual-text` to
 the derivation's `patches`. The plugin
 detects the API at load time and falls back to the split view without it;
 `(mokh-configure! #:inline #f)` forces the split view.
 
 The rows use the theme scopes `ui.virtual.diff.minus` and
-`ui.virtual.diff.plus` for the backgrounds (add them to your theme, e.g.
-`bg = "#3b1d22"` and `bg = "#1b3324"`) and `diff.minus` / `diff.plus` for the
-text, which every theme has.
+`ui.virtual.diff.plus` for the backgrounds and `diff.minus` / `diff.plus` for
+the text, which every theme has. With dna.hx's `helix-theme.patch` the
+backgrounds are inherited from any theme (a fifth of `diff.minus` /
+`diff.plus` over its background, again on every theme change); a theme can
+set them itself, e.g. `bg = "#3b1d22"` and `bg = "#1b3324"`.
 
 ## Tools
 
