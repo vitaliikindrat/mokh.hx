@@ -143,9 +143,11 @@ line highlights, one `LineAnnotation` that reserves the rows (so cursor
 movement and scrolling skip them, like inline diagnostics) and one
 `Decoration` that paints them, exposed to Steel as `add-virtual-lines`,
 `add-line-highlight`, `remove-virtual-text` and `clear-virtual-text` in
-`helix/misc.scm`. It is `patches/helix-virtual-text.patch` (about 350
-lines, additive, against `mattwparas/helix` at `424add1`). Apply it to your
-Steel build; with Nix, add it to the derivation's `patches`. The plugin
+`helix/misc.scm`. It lives in [canopy.hx](https://github.com/vitaliikindrat/canopy.hx)
+as `helix-virtual-text.patch` (about 350 additive lines, against
+`mattwparas/helix` at `424add1`), with the other Steel plugin APIs. Apply it
+to your Steel build; with Nix, add `inputs.canopy.patches.virtual-text` to
+the derivation's `patches`. The plugin
 detects the API at load time and falls back to the split view without it;
 `(mokh-configure! #:inline #f)` forces the split view.
 
