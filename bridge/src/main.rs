@@ -3,7 +3,8 @@
 //! Lifecycle: bind, write the lock file, print `ready`, serve until stdin
 //! closes (the editor went away), a `shutdown` message arrives, or SIGTERM /
 //! Ctrl-C. The lock file is removed on every exit path so Claude's `/ide`
-//! never lists a dead editor.
+//! never lists a dead editor. On startup it also retires any older bridge
+//! the same editor process started (see `lockfile::retire_siblings`).
 
 use std::path::PathBuf;
 
@@ -39,6 +40,40 @@ fn random_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+enum Exit {
+    Normal,
+    /// A newer bridge from the same editor asked us to step aside (SIGUSR1).
+    Superseded,
+}
+
+/// Resolves when a signal asks us to stop. The handlers are installed when
+/// this is called, not when the future is first polled.
+#[cfg(unix)]
+fn stop_signal() -> Result<impl std::future::Future<Output = Exit>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut term = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    // SIGHUP arrives when the terminal that started hx goes away;
+    // without a handler it would kill us before the lock file is removed.
+    let mut hup = signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+    let mut usr1 = signal(SignalKind::user_defined1()).context("installing SIGUSR1 handler")?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => Exit::Normal,
+            _ = term.recv() => Exit::Normal,
+            _ = hup.recv() => Exit::Normal,
+            _ = usr1.recv() => Exit::Superseded,
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn stop_signal() -> Result<impl std::future::Future<Output = Exit>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+        Exit::Normal
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -59,10 +94,19 @@ async fn main() -> Result<()> {
     let token = random_token();
 
     let (to_editor, mut from_bridge) = mpsc::unbounded_channel::<Value>();
+    let stdout_tx = to_editor.clone();
     let bridge = Bridge::new(token.clone(), args.ide_name.clone(), workspaces.clone(), to_editor);
+
+    // Install signal handlers before the lock file exists: a newer bridge
+    // finds us through it and may send SIGUSR1 straight away, whose default
+    // action would kill us without telling the editor.
+    let stop = stop_signal()?;
 
     for stale in lockfile::sweep_stale(&lock_dir) {
         eprintln!("mokh-bridge: removed stale lock file for port {stale}");
+    }
+    for pid in lockfile::retire_siblings(&lock_dir) {
+        eprintln!("mokh-bridge: retired previous bridge {pid} from the same editor");
     }
     lockfile::write(&lock_dir, port, &args.ide_name, &token, &workspaces)
         .context("writing the lock file")?;
@@ -73,6 +117,10 @@ async fn main() -> Result<()> {
     let stdout_task = tokio::spawn(async move {
         let mut out = tokio::io::stdout();
         while let Some(value) = from_bridge.recv().await {
+            // Null is our own "flush and stop" marker, never a real message.
+            if value.is_null() {
+                break;
+            }
             let mut line = value.to_string();
             line.push('\n');
             if out.write_all(line.as_bytes()).await.is_err() || out.flush().await.is_err() {
@@ -114,36 +162,31 @@ async fn main() -> Result<()> {
         }
     });
 
-    let terminate = async {
-        #[cfg(unix)]
-        {
-            let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("installing SIGTERM handler");
-            // SIGHUP arrives when the terminal that started hx goes away;
-            // without a handler it would kill us before the lock file is removed.
-            let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                .expect("installing SIGHUP handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term.recv() => {}
-                _ = hup.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
+    let exit = tokio::select! {
+        _ = stdin_task => Exit::Normal,
+        e = stop => e,
+        r = server => {
+            if let Ok(Err(e)) = r { eprintln!("mokh-bridge: server error: {e:#}"); }
+            Exit::Normal
         }
     };
 
-    tokio::select! {
-        _ = stdin_task => {}
-        _ = terminate => {}
-        r = server => {
-            if let Ok(Err(e)) = r { eprintln!("mokh-bridge: server error: {e:#}"); }
-        }
-    }
-
     lockfile::remove(&lock_dir, port);
-    stdout_task.abort();
-    Ok(())
+    match exit {
+        Exit::Superseded => {
+            // Tell the plugin this bridge was replaced, so its reader thread
+            // stops without calling back into the editor: after a config
+            // reload that thread belongs to a discarded Steel engine, and a
+            // callback from it crashes hx. Flush before exiting.
+            let _ = stdout_tx.send(json!({ "method": "superseded", "params": {} }));
+            let _ = stdout_tx.send(Value::Null);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), stdout_task).await;
+        }
+        Exit::Normal => stdout_task.abort(),
+    }
+    // Exit now rather than returning: dropping the runtime waits for the
+    // blocking thread behind tokio::io::stdin, which only wakes on the next
+    // line or EOF. After SIGTERM/SIGHUP the editor may still hold our stdin
+    // open, so returning would hang here forever.
+    std::process::exit(0)
 }

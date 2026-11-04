@@ -718,17 +718,28 @@
      (status "mokh: Claude Code disconnected")]
     [else void]))
 
+;; `superseded` means a newer bridge from this editor replaced ours, which
+;; happens when `:config-reload` rebuilt the Steel engine and init.scm ran
+;; mokh-start again. This thread then belongs to the discarded engine, and
+;; any hx.with-context from it would run old-engine code in the new engine
+;; and crash hx, so it stops without touching the editor.
+(define (superseded? msg)
+  (equal? (json-string msg 'method) "superseded"))
+
 (define (reader-loop port)
   (let loop ()
     (define line (read-line-from-port port))
-    (unless (eof-object? line)
-      (let ([trimmed (trim line)])
-        (unless (equal? trimmed "")
-          (let ([msg (with-handler (lambda (e) #f) (string->jsexpr trimmed))])
-            (when msg
-              (hx.with-context (lambda () (handle-message msg)))))))
-      (loop)))
-  (hx.with-context on-bridge-exit))
+    (if (eof-object? line)
+        (hx.with-context on-bridge-exit)
+        (let* ([trimmed (trim line)]
+               [msg (and (not (equal? trimmed ""))
+                         (with-handler (lambda (e) #f) (string->jsexpr trimmed)))])
+          (cond
+            [(and msg (superseded? msg)) void]
+            [else
+             (when msg
+               (hx.with-context (lambda () (handle-message msg))))
+             (loop)])))))
 
 (define (on-bridge-exit)
   (when *child*
