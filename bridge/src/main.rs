@@ -105,9 +105,9 @@ async fn main() -> Result<()> {
     for stale in lockfile::sweep_stale(&lock_dir) {
         eprintln!("mokh-bridge: removed stale lock file for port {stale}");
     }
-    for pid in lockfile::retire_siblings(&lock_dir) {
-        eprintln!("mokh-bridge: retired previous bridge {pid} from the same editor");
-    }
+    // Silently: our stderr is the editor's terminal, so printing here would
+    // draw over Helix on every :config-reload.
+    lockfile::retire_siblings(&lock_dir);
     lockfile::write(&lock_dir, port, &args.ide_name, &token, &workspaces)
         .context("writing the lock file")?;
 
