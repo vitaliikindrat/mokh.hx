@@ -23,6 +23,7 @@ pub fn write(dir: &Path, port: u16, ide_name: &str, token: &str, folders: &[Stri
     set_mode(dir, 0o700);
     let body = json!({
         "pid": std::process::id(),
+        "editorPid": editor_pid(),
         "workspaceFolders": folders,
         "ideName": ide_name,
         "transport": "ws",
@@ -36,6 +37,71 @@ pub fn write(dir: &Path, port: u16, ide_name: &str, token: &str, folders: &[Stri
     std::fs::rename(&tmp, &path)?;
     Ok(path)
 }
+
+/// The editor that spawned us. Recorded in the lock file so a later bridge
+/// from the same editor can find and retire this one.
+pub fn editor_pid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getppid() as u32 }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Retire older bridges started by the same editor process. Steel-enabled
+/// Helix rebuilds its scripting engine on `:config-reload` and re-runs
+/// init.scm, so the plugin starts a fresh bridge while the old one, owned by
+/// the discarded engine, would otherwise live until the editor exits. Each
+/// sibling gets SIGUSR1: it tells its plugin it was superseded, removes its
+/// own lock file and exits. We remove the lock file too, so `/ide` never
+/// lists it in the meantime. Only lock files carrying `editorPid` are
+/// considered, so bridges too old to handle SIGUSR1 are left alone. Returns
+/// the pids signalled.
+pub fn retire_siblings(dir: &Path) -> Vec<u32> {
+    let me = std::process::id();
+    let editor = editor_pid();
+    let mut retired = Vec::new();
+    // pid 1 means we were orphaned: every orphan would look like a sibling.
+    if editor <= 1 {
+        return retired;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return retired;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".lock") {
+            continue;
+        }
+        let Ok(body) = std::fs::read(entry.path()) else { continue };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else { continue };
+        let pid = value.get("pid").and_then(serde_json::Value::as_u64).map(|p| p as u32);
+        let owner = value.get("editorPid").and_then(serde_json::Value::as_u64).map(|p| p as u32);
+        let (Some(pid), Some(owner)) = (pid, owner) else { continue };
+        if owner != editor || pid == me {
+            continue;
+        }
+        if process_alive(pid) {
+            supersede(pid);
+            retired.push(pid);
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
+    retired
+}
+
+#[cfg(unix)]
+fn supersede(pid: u32) {
+    unsafe {
+        libc::kill(pid as i32, libc::SIGUSR1);
+    }
+}
+
+#[cfg(not(unix))]
+fn supersede(_pid: u32) {}
 
 pub fn remove(dir: &Path, port: u16) {
     let _ = std::fs::remove_file(path_for(dir, port));
@@ -98,6 +164,7 @@ mod tests {
         assert_eq!(v["authToken"], "deadbeef");
         assert_eq!(v["workspaceFolders"][0], "/tmp/proj");
         assert_eq!(v["pid"], std::process::id());
+        assert_eq!(v["editorPid"], editor_pid());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -105,6 +172,40 @@ mod tests {
         }
         remove(&dir, 43210);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retire_siblings_signals_only_bridges_of_our_editor() {
+        let dir = std::env::temp_dir().join(format!("mokh-retire-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let editor = editor_pid();
+        // A live sibling from our editor (a child we can signal and reap).
+        let mut sibling = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(
+            dir.join("50011.lock"),
+            serde_json::to_vec(&json!({"pid": sibling.id(), "editorPid": editor})).unwrap(),
+        )
+        .unwrap();
+        // Another editor's bridge: untouched.
+        std::fs::write(
+            dir.join("50012.lock"),
+            serde_json::to_vec(&json!({"pid": std::process::id(), "editorPid": editor + 1})).unwrap(),
+        )
+        .unwrap();
+        // Our own lock file: untouched.
+        write(&dir, 50013, "Helix", "a", &[]).unwrap();
+        // An old-format lock without editorPid: untouched.
+        std::fs::write(dir.join("50014.lock"), r#"{"pid": 1}"#).unwrap();
+
+        let retired = retire_siblings(&dir);
+
+        assert_eq!(retired, vec![sibling.id()]);
+        assert!(!sibling.wait().unwrap().success());
+        assert!(!path_for(&dir, 50011).exists());
+        assert!(path_for(&dir, 50012).exists());
+        assert!(path_for(&dir, 50013).exists());
+        assert!(path_for(&dir, 50014).exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
